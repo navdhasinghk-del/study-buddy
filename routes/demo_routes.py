@@ -1,10 +1,11 @@
 import os
 import io
 import json
+import traceback
 from datetime import datetime
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Request, Header, UploadFile, File, Form, status
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form, status
+from fastapi.responses import HTMLResponse, JSONResponse
 import fitz
 from google import genai
 from google.genai import types
@@ -166,7 +167,7 @@ async def serve_demo_ui():
                 } else if (feat === 'doc_reader') {
                     html = `
                         <label>Upload PDF Document (Max 10MB):</label>
-                        <input type="file" id="pdfFile" accept="application/pdf" />
+                        <input type="file" id="pdfFile" accept=".pdf,application/pdf" />
                         <div class="note">Extracts metadata and previews Page 1 clean text.</div>
                     `;
                 } else if (feat === 'voice_evaluator') {
@@ -199,10 +200,11 @@ async def serve_demo_ui():
 
                 if (feat === 'doc_reader') {
                     const fileInput = document.getElementById('pdfFile');
-                    if (!fileInput.files[0]) {
+                    if (!fileInput.files || fileInput.files.length === 0) {
                         alert("Please select a PDF file first.");
                         btn.disabled = false;
                         btn.innerText = "Run Feature Demo";
+                        resBox.style.display = "none";
                         return;
                     }
                     formData.append("file", fileInput.files[0]);
@@ -215,6 +217,7 @@ async def serve_demo_ui():
                         alert("Context text is required.");
                         btn.disabled = false;
                         btn.innerText = "Run Feature Demo";
+                        resBox.style.display = "none";
                         return;
                     }
                     formData.append("context", ctx);
@@ -228,11 +231,24 @@ async def serve_demo_ui():
                         body: formData
                     });
 
-                    const data = await resp.json();
+                    const rawText = await resp.text();
+                    let displayContent = "";
+                    
+                    try {
+                        const parsedJson = JSON.parse(rawText);
+                        if (parsedJson.detail) {
+                            displayContent = typeof parsedJson.detail === 'string' ? parsedJson.detail : JSON.stringify(parsedJson.detail, null, 2);
+                        } else {
+                            displayContent = JSON.stringify(parsedJson, null, 2);
+                        }
+                    } catch (e) {
+                        displayContent = rawText;
+                    }
+
                     if (resp.status === 200) {
-                        resBox.innerHTML = `<span class="badge-200">✓ SUCCESS (1/1 Daily Demo Limit Used)</span>\n\n` + JSON.stringify(data, null, 2);
+                        resBox.innerHTML = `<span class="badge-200">✓ SUCCESS (1/1 Daily Demo Limit Used)</span>\n\n` + displayContent;
                     } else {
-                        resBox.innerHTML = `<span class="badge-429">✕ Limit / Error [${resp.status}]</span>\n\n` + (data.detail || JSON.stringify(data, null, 2));
+                        resBox.innerHTML = `<span class="badge-429">✕ Response [${resp.status}]</span>\n\n` + displayContent;
                     }
                 } catch (err) {
                     resBox.innerHTML = `<span class="badge-429">Network Error</span>\n\n` + err.message;
@@ -257,76 +273,96 @@ async def execute_demo_feature(
 ):
     client_ip = get_client_ip(request)
 
-    check_and_enforce_ip_daily_limit(client_ip, feature_name)
+    try:
+        check_and_enforce_ip_daily_limit(client_ip, feature_name)
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"Database Rate Limit Error: {str(e)}"})
 
-    if feature_name == "qa_workspace":
-        if not context or not question:
-            raise HTTPException(status_code=400, detail="Context and Question are required.")
-        if len(context) > 3500 or len(question) > 300:
-            raise HTTPException(status_code=400, detail="Text exceeds demo limit.")
+    try:
+        if feature_name == "qa_workspace":
+            if not context or not question:
+                return JSONResponse(status_code=400, content={"detail": "Context and Question are required."})
+            if len(context) > 3500 or len(question) > 300:
+                return JSONResponse(status_code=400, content={"detail": "Text exceeds demo character limit."})
 
-        system_prompt = (
-            "You are a strict academic evaluator. Answer the question using ONLY the context provided. "
-            "Follow format: QUESTION: [q] | ANSWER: [ans] | PAGES: N/A"
+            system_prompt = (
+                "You are a strict academic evaluator. Answer the question using ONLY the context provided. "
+                "Follow format: QUESTION: [q] | ANSWER: [ans] | PAGES: N/A"
+            )
+            resp = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=f"CONTEXT:\n{context}\n\nQUESTION:\n{question}",
+                config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.0)
+            )
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "success",
+                    "feature": "AI Q&A Workspace",
+                    "result": resp.text.strip() if resp.text else "No answer generated."
+                }
+            )
+
+        elif feature_name == "doc_reader":
+            if not file:
+                return JSONResponse(status_code=400, content={"detail": "PDF File is required."})
+            if not file.filename.lower().endswith(".pdf"):
+                return JSONResponse(status_code=400, content={"detail": "Only PDF format allowed."})
+
+            file_bytes = await file.read()
+            if len(file_bytes) > 10 * 1024 * 1024:
+                return JSONResponse(status_code=403, content={"detail": "Free Tier limit: PDF size exceeds 10MB."})
+
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            total_pages = len(doc)
+            p1_text = doc[0].get_text("text").strip() if total_pages > 0 else ""
+            doc.close()
+
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "success",
+                    "feature": "Document Reader",
+                    "filename": file.filename,
+                    "total_pages": total_pages,
+                    "page_1_preview": p1_text[:600] if p1_text else "[Empty or Image-based PDF]"
+                }
+            )
+
+        elif feature_name == "voice_evaluator":
+            if not context or not question or not spoken_text:
+                return JSONResponse(status_code=400, content={"detail": "Context, Question, and Spoken Text are required."})
+
+            prompt = (
+                f"You are an oral exam evaluator.\n"
+                f"Reference Context: {context}\n"
+                f"Question: {question}\n"
+                f"Student Spoken Response: {spoken_text}\n\n"
+                f"Evaluate semantic accuracy and return strictly JSON: {{\"percentage\": 85, \"verdict\": \"correct\" or \"retry\"}}"
+            )
+            resp = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
+            )
+            evaluation_data = json.loads(resp.text) if resp.text else {"percentage": 0, "verdict": "retry"}
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "status": "success",
+                    "feature": "Voice Recall Evaluator",
+                    "evaluation": evaluation_data
+                }
+            )
+
+        else:
+            return JSONResponse(status_code=400, content={"detail": "Unknown feature selected."})
+
+    except Exception as general_err:
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Execution Engine Error: {str(general_err)}"}
         )
-        resp = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=f"CONTEXT:\n{context}\n\nQUESTION:\n{question}",
-            config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.0)
-        )
-        return {
-            "status": "success",
-            "feature": "AI Q&A Workspace",
-            "result": resp.text.strip() if resp.text else "No answer generated."
-        }
-
-    elif feature_name == "doc_reader":
-        if not file:
-            raise HTTPException(status_code=400, detail="PDF File is required.")
-        if not file.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Only PDF format allowed.")
-
-        file.file.seek(0, os.SEEK_END)
-        size = file.file.tell()
-        file.file.seek(0)
-        if size > 10 * 1024 * 1024:
-            raise HTTPException(status_code=403, detail="Free Tier limit: PDF size exceeds 10MB.")
-
-        file_bytes = await file.read()
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        total_pages = len(doc)
-        p1_text = doc[0].get_text("text") if total_pages > 0 else ""
-        doc.close()
-
-        return {
-            "status": "success",
-            "feature": "Document Reader",
-            "filename": file.filename,
-            "total_pages": total_pages,
-            "page_1_preview": p1_text[:600] + ("..." if len(p1_text) > 600 else "")
-        }
-
-    elif feature_name == "voice_evaluator":
-        if not context or not question or not spoken_text:
-            raise HTTPException(status_code=400, detail="Context, Question, and Spoken Text are required.")
-
-        prompt = (
-            f"You are an oral exam evaluator.\n"
-            f"Reference Context: {context}\n"
-            f"Question: {question}\n"
-            f"Student Spoken Response: {spoken_text}\n\n"
-            f"Evaluate semantic accuracy and return strictly JSON: {{\"percentage\": 85, \"verdict\": \"correct\" or \"retry\"}}"
-        )
-        resp = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
-        )
-        return {
-            "status": "success",
-            "feature": "Voice Recall Evaluator",
-            "evaluation": json.loads(resp.text) if resp.text else {"percentage": 0, "verdict": "retry"}
-        }
-
-    else:
-        raise HTTPException(status_code=400, detail="Unknown feature selected.")
