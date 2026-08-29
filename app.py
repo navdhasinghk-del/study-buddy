@@ -2,6 +2,7 @@ import os
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, Request, status
+from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor
 
@@ -21,7 +22,12 @@ load_dotenv()
 RAW_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 ALLOWED_ORIGINS = [origin.strip() for origin in RAW_ORIGINS.split(",") if origin.strip()]
 
-app = FastAPI(title="Study Buddy Gateway Engine")
+app = FastAPI(
+    title="Study Buddy Gateway Engine",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,6 +45,10 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
     return response
+
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    return RedirectResponse(url="/demo/")
 
 @app.post("/admin/toggle-premium")
 async def toggle_user_premium(
