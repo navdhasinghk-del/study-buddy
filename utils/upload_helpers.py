@@ -11,16 +11,47 @@ from google.genai import types
 
 MODEL_NAME = "gemini-2.5-flash"
 
-# --- PYDANTIC SCHEMA FOR STRICT VISION OUTPUT ---
 class ExtractedQuestions(BaseModel):
     questions: List[str] = Field(
         description="List of fully reconstructed academic or evaluation questions. UI elements, page numbers, and filenames must be strictly excluded."
     )
 
+KRUTI_DEV_MAPPINGS = {
+    "k": "ा", "d": "क", "f": "ि", "g": "ह", "h": "ी", "j": "र",
+    "l": "त", "m": "म", "n": "न", "o": "द", "p": "च", "r": "प",
+    "s": "े", "t": "त", "u": "ु", "v": "अ", "w": "ै", "x": "ग",
+    "y": "ल", "z": "्र", "A": "ा", "B": "ी", "D": "्", "F": "ँ",
+    "G": "ा", "H": "ी", "K": "ा", "L": "स", "M": "ं", "N": "छ",
+    "O": "इ", "P": "फ", "R": "ज्ञ", "S": "े", "T": "ू", "U": "ू",
+    "V": "ट", "W": "ै", "X": "घ", "Y": "भ", "Z": "र्", "1": "1",
+    "2": "2", "3": "3", "4": "4", "5": "5", "6": "6", "7": "7",
+    "8": "8", "9": "9", "0": "0"
+}
+
+def decode_kruti_dev_text(text: str) -> str:
+    if not text:
+        return text
+    decoded = ""
+    for char in text:
+        decoded += KRUTI_DEV_MAPPINGS.get(char, char)
+    return decoded
+
+def is_scrambled_legacy_font(text: str) -> bool:
+    if not text:
+        return False
+    scrambled_patterns = [r"fo'k;", r"d{kk", r"ekWMy", r"iz\"u", r"oLrqfu'B", r"v/;k;"]
+    for pattern in scrambled_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
+
 def protect_and_normalize_font(text_stream: str) -> str:
     if not text_stream or text_stream.strip() == "[Empty Page]":
         return "[Empty Page]"
     
+    if is_scrambled_legacy_font(text_stream):
+        text_stream = decode_kruti_dev_text(text_stream)
+        
     normalized_text = unicodedata.normalize('NFKC', text_stream)
     if "cid:" in normalized_text or "unknown:" in normalized_text:
         return "[Empty Page]"
@@ -39,7 +70,6 @@ def protect_and_normalize_font(text_stream: str) -> str:
         
     return final_output
 
-
 async def extract_text_via_gemini_ocr(page: fitz.Page, client) -> str:
     try:
         zoom = 2
@@ -53,7 +83,7 @@ async def extract_text_via_gemini_ocr(page: fitz.Page, client) -> str:
         )
         
         ocr_prompt = (
-            "Extract all readable text from this image page. "
+            "Extract all readable text from this image page in clean Unicode Hindi or English. "
             "Maintain the original layout structure and paragraph lines. "
             "Do not add any explanations, introductory text, or formatting notes. Just return the raw extracted text."
         )
@@ -70,7 +100,6 @@ async def extract_text_via_gemini_ocr(page: fitz.Page, client) -> str:
     except Exception:
         return "[Empty Page]"
 
-
 async def extract_direct_image_file(file_path: str, client) -> str:
     try:
         with open(file_path, "rb") as f:
@@ -85,7 +114,7 @@ async def extract_direct_image_file(file_path: str, client) -> str:
         )
         
         ocr_prompt = (
-            "Extract all readable text from this document image. "
+            "Extract all readable text from this document image in clean Unicode Hindi or English. "
             "Maintain original paragraph layout. Do not add any extra text or notes."
         )
         
@@ -101,7 +130,6 @@ async def extract_direct_image_file(file_path: str, client) -> str:
     except Exception:
         return "[Empty Page]"
 
-
 async def parse_any_file_to_pages(file_path: str, client) -> List[str]:
     ext = os.path.splitext(file_path)[-1].lower()
     pages_text = []
@@ -111,11 +139,13 @@ async def parse_any_file_to_pages(file_path: str, client) -> List[str]:
         for page_num in range(len(doc)):
             page = doc[page_num]
             content = page.get_text()
-            text_content = protect_and_normalize_font(content)
             
-            if text_content == "[Empty Page]":
+            if is_scrambled_legacy_font(content) or not content.strip():
                 ocr_result = await extract_text_via_gemini_ocr(page, client)
                 text_content = protect_and_normalize_font(ocr_result)
+            else:
+                text_content = protect_and_normalize_font(content)
+                
             pages_text.append(text_content)
         doc.close()
         
@@ -140,7 +170,6 @@ async def parse_any_file_to_pages(file_path: str, client) -> List[str]:
                 
     return [p if p.strip() else "[Empty Page]" for p in pages_text]
 
-
 async def process_image_via_vision_ai(file_path: str, client) -> list:
     try:
         with open(file_path, "rb") as f:
@@ -162,7 +191,7 @@ async def process_image_via_vision_ai(file_path: str, client) -> list:
             "- If a single question is broken down into multiple lines or has arbitrary line breaks due to layout, "
             "you MUST intelligently merge them into one single continuous string sequence.\n"
             "- Completely IGNORE and FILTER OUT all user interface elements, application headers, top action bars, back arrows, "
-            "search icons, file names (e.g., 'G.pdf'), page counters (e.g., 'Page 1 of 1'), and bottom navigation dock icons.\n"
+            "search icons, file names, page counters, and bottom navigation dock icons.\n"
             "- Do not include raw layout artifacts."
         )
         
@@ -187,7 +216,6 @@ async def process_image_via_vision_ai(file_path: str, client) -> list:
     except Exception:
         return []
 
-
 def smart_question_sanitizer(raw_pages: list) -> list:
     compiled_questions = []
     
@@ -205,7 +233,7 @@ def smart_question_sanitizer(raw_pages: list) -> list:
             continue
             
         current_question_buffer.append(clean_line)
-        if clean_line.endswith("?"):
+        if clean_line.endswith("?") or clean_line.endswith("।"):
             combined_q = " ".join(current_question_buffer).strip()
             if combined_q and len(combined_q) > 5:
                 compiled_questions.append(combined_q)

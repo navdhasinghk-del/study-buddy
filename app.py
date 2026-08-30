@@ -5,6 +5,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg2.extras import RealDictCursor
+from firebase_admin import auth
 
 from routes import (
     upload_routes, 
@@ -15,7 +16,12 @@ from routes import (
     referral_routes, 
     demo_routes
 )
-from dependencies import verify_firebase_token, get_postgres_db, verify_secure_bypass_key
+from dependencies import (
+    verify_firebase_token, 
+    get_postgres_db, 
+    verify_secure_bypass_key,
+    get_encrypted_notes_connection
+)
 
 load_dotenv()
 
@@ -124,6 +130,30 @@ async def cancel_subscription(decoded_token: dict = Depends(verify_firebase_toke
             conn.commit()
     
     return {"status": "success"}
+
+@app.delete("/api/delete-account")
+async def delete_user_account(decoded_token: dict = Depends(verify_firebase_token)):
+    raw_uid = decoded_token["uid"]
+    clean_uid = raw_uid.strip().lower()
+    
+    try:
+        with get_postgres_db() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM user_limits WHERE LOWER(user_id) = %s;", (clean_uid,))
+                cursor.execute("DELETE FROM user_profiles WHERE LOWER(user_id) = %s;", (clean_uid,))
+                conn.commit()
+
+        notes_db = get_encrypted_notes_connection(clean_uid)
+        notes_db["notes"].delete_many({"user_id": clean_uid})
+
+        auth.delete_user(raw_uid)
+
+        return {"status": "success", "message": "Account and associated data deleted permanently."}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
 
 app.include_router(upload_routes.router)
 app.include_router(download_routes.router)
