@@ -1,6 +1,6 @@
 import os
 from fastapi import APIRouter, HTTPException, Depends, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List
 from bson import ObjectId
 from datetime import datetime
@@ -12,6 +12,11 @@ class CategoryCreate(BaseModel):
     name: str
 
 class NoteCreate(BaseModel):
+    category_id: str
+    title: str
+    content: str
+
+class NoteUpdate(BaseModel):
     category_id: str
     title: str
     content: str
@@ -90,3 +95,35 @@ async def get_notes_by_category(category_id: str, decoded_token: dict = Depends(
         
     cursor = db.notes.find({"category_id": category_id, "user_id": user_id}).sort("_id", -1)
     return [{"id": str(doc["_id"]), "title": doc["title"], "content": doc["content"], "updated_at": doc["updated_at"]} for doc in cursor]
+
+@router.put("/notes/{note_id}")
+async def update_note(note_id: str, data: NoteUpdate, decoded_token: dict = Depends(verify_firebase_token)):
+    user_id = decoded_token["uid"].strip().lower()
+    try:
+        db = get_encrypted_notes_connection(user_id)
+        result = db.notes.update_one(
+            {"_id": ObjectId(note_id), "user_id": user_id},
+            {"$set": {
+                "category_id": data.category_id,
+                "title": data.title.strip(),
+                "content": data.content.strip(),
+                "updated_at": datetime.utcnow().isoformat()
+            }}
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Note not found.")
+        return {"status": "success", "message": "Note updated successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/notes/{note_id}")
+async def delete_note(note_id: str, decoded_token: dict = Depends(verify_firebase_token)):
+    user_id = decoded_token["uid"].strip().lower()
+    try:
+        db = get_encrypted_notes_connection(user_id)
+        result = db.notes.delete_one({"_id": ObjectId(note_id), "user_id": user_id})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Note not found.")
+        return {"status": "success", "message": "Note deleted successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
