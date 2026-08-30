@@ -40,7 +40,7 @@ Note: If semantic match is 80% or above, set "verdict": "correct". If below 80%,
 """
 
 async def save_supabase_voice_session(user_id: str, context: str, questions: list):
-    async with httpx.AsyncClient() as http_client:
+    async with httpx.AsyncClient(timeout=30.0) as http_client:
         headers = {
             "apikey": SUPABASE_KEY,
             "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -53,21 +53,30 @@ async def save_supabase_voice_session(user_id: str, context: str, questions: lis
             "questions": questions,
             "attempted_count": 0
         }
-        await http_client.post(f"{SUPABASE_URL}/rest/v1/voice_sessions", headers=headers, json=payload)
+        resp = await http_client.post(
+            f"{SUPABASE_URL}/rest/v1/voice_sessions?on_conflict=user_id",
+            headers=headers,
+            json=payload
+        )
+        if resp.status_code not in [200, 201]:
+            print(f"Supabase save error: {resp.text}")
 
 async def get_supabase_voice_session(user_id: str) -> dict:
-    async with httpx.AsyncClient() as http_client:
+    async with httpx.AsyncClient(timeout=30.0) as http_client:
         headers = {
             "apikey": SUPABASE_KEY,
             "Authorization": f"Bearer {SUPABASE_KEY}"
         }
-        resp = await http_client.get(f"{SUPABASE_URL}/rest/v1/voice_sessions?user_id=eq.{user_id}&select=*", headers=headers)
+        resp = await http_client.get(
+            f"{SUPABASE_URL}/rest/v1/voice_sessions?user_id=eq.{user_id}&select=*",
+            headers=headers
+        )
         if resp.status_code == 200 and resp.json():
             return resp.json()[0]
     return {"full_text_context": "", "attempted_count": 0, "questions": []}
 
 async def update_voice_attempt(user_id: str, new_count: int):
-    async with httpx.AsyncClient() as http_client:
+    async with httpx.AsyncClient(timeout=30.0) as http_client:
         headers = {
             "apikey": SUPABASE_KEY,
             "Authorization": f"Bearer {SUPABASE_KEY}",
@@ -80,7 +89,6 @@ async def update_voice_attempt(user_id: str, new_count: int):
         )
 
 def auto_detect_language_voice(text: str) -> str:
-    # 1. Indic Scripts & Regional Languages
     if re.search(r'[\u0B80-\u0BFF]', text):
         return "ta-IN-PallaviNeural"
     elif re.search(r'[\u0C00-\u0C7F]', text):
@@ -104,8 +112,6 @@ def auto_detect_language_voice(text: str) -> str:
         return "hi-IN-MadhurNeural"
     elif re.search(r'[\u0600-\u06FF]', text):
         return "ur-IN-SalmanNeural"
-
-    # 2. Asian & Middle Eastern Scripts
     elif re.search(r'[\u4E00-\u9FFF]', text):
         return "zh-CN-XiaoxiaoNeural"
     elif re.search(r'[\u3040-\u309F\u30A0-\u30FF]', text):
@@ -120,8 +126,6 @@ def auto_detect_language_voice(text: str) -> str:
         return "el-GR-AthinaNeural"
     elif re.search(r'[\u0590-\u05FF]', text):
         return "he-IL-AvriNeural"
-
-    # 3. Global Latin-Script Languages
     elif re.search(r'\b(que|para|por|con|como|este|esta|pero|del|los|las)\b', text.lower()):
         return "es-ES-AlvaroNeural"
     elif re.search(r'\b(pour|avec|dans|plus|tout|faire|mais|nous|vous)\b', text.lower()):
@@ -191,10 +195,12 @@ async def process_voice_material(file: UploadFile = File(...), decoded_token: di
                 detected_questions = parsed_json.get("questions", [])
                 
         if not detected_questions:
-            raise HTTPException(status_code=400, detail="Intelligence engine could not extract questions.")
+            raise HTTPException(status_code=400, detail="Could not extract questions from document.")
             
         await save_supabase_voice_session(firebase_uid, full_text_context, detected_questions)
         return {"status": "success", "questions": detected_questions}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -277,7 +283,7 @@ async def evaluate_audio_recall(question: str = Form(...), file: UploadFile = Fi
 async def flush_voice_session(decoded_token: dict = Depends(verify_firebase_token)):
     firebase_uid = decoded_token["uid"].strip().lower()
     try:
-        async with httpx.AsyncClient() as http_client:
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
             headers = {
                 "apikey": SUPABASE_KEY,
                 "Authorization": f"Bearer {SUPABASE_KEY}"

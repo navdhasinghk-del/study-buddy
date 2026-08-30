@@ -52,7 +52,7 @@ def protect_and_normalize_font(text_stream: str) -> str:
     if is_scrambled_legacy_font(text_stream):
         text_stream = decode_kruti_dev_text(text_stream)
         
-    normalized_text = unicodedata.normalize('NFKC', text_stream)
+    normalized_text = unicodedata.normalize('NFC', text_stream)
     if "cid:" in normalized_text or "unknown:" in normalized_text:
         return "[Empty Page]"
         
@@ -70,6 +70,19 @@ def protect_and_normalize_font(text_stream: str) -> str:
         
     return final_output
 
+def extract_clean_blocks_from_page(page: fitz.Page) -> str:
+    try:
+        blocks = page.get_text("blocks")
+        blocks = sorted(blocks, key=lambda b: (b[1], b[0]))
+        text_chunks = []
+        for b in blocks:
+            text = b[4].strip()
+            if text:
+                text_chunks.append(text)
+        return "\n\n".join(text_chunks)
+    except Exception:
+        return page.get_text()
+
 async def extract_text_via_gemini_ocr(page: fitz.Page, client) -> str:
     try:
         zoom = 2
@@ -83,9 +96,9 @@ async def extract_text_via_gemini_ocr(page: fitz.Page, client) -> str:
         )
         
         ocr_prompt = (
-            "Extract all readable text from this image page in clean Unicode Hindi or English. "
-            "Maintain the original layout structure and paragraph lines. "
-            "Do not add any explanations, introductory text, or formatting notes. Just return the raw extracted text."
+            "Extract all readable text from this image page in clean Unicode Hindi (Devanagari) or English. "
+            "Preserve matras, conjunct characters, layout structure, and paragraphs exactly. "
+            "Do not omit Hindi words or characters. Do not add any commentary, just return the extracted text."
         )
         
         loop = asyncio.get_running_loop()
@@ -115,7 +128,7 @@ async def extract_direct_image_file(file_path: str, client) -> str:
         
         ocr_prompt = (
             "Extract all readable text from this document image in clean Unicode Hindi or English. "
-            "Maintain original paragraph layout. Do not add any extra text or notes."
+            "Maintain complete sentences, Hindi matras, and paragraph structure. Return only the extracted text."
         )
         
         loop = asyncio.get_running_loop()
@@ -138,9 +151,9 @@ async def parse_any_file_to_pages(file_path: str, client) -> List[str]:
         doc = fitz.open(file_path)
         for page_num in range(len(doc)):
             page = doc[page_num]
-            content = page.get_text()
+            content = extract_clean_blocks_from_page(page)
             
-            if is_scrambled_legacy_font(content) or not content.strip():
+            if is_scrambled_legacy_font(content) or not content.strip() or len(content.strip()) < 15:
                 ocr_result = await extract_text_via_gemini_ocr(page, client)
                 text_content = protect_and_normalize_font(ocr_result)
             else:
@@ -162,7 +175,7 @@ async def parse_any_file_to_pages(file_path: str, client) -> List[str]:
         try:
             doc = fitz.open(file_path)
             for page in doc:
-                pages_text.append(protect_and_normalize_font(page.get_text()))
+                pages_text.append(protect_and_normalize_font(extract_clean_blocks_from_page(page)))
             doc.close()
         except Exception:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:

@@ -1,16 +1,17 @@
 import os
-import fitz
 import shutil
 import uuid
 from fastapi import APIRouter, HTTPException, UploadFile, File, Depends
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from google import genai
 from dependencies import verify_firebase_token, get_encrypted_notes_connection
-from utils.upload_helpers import protect_and_normalize_font
+from utils.upload_helpers import parse_any_file_to_pages
 
 load_dotenv()
 
 router = APIRouter()
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -38,8 +39,8 @@ async def upload_pdf_session(
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        doc = fitz.open(temp_path)
-        total_pages = len(doc)
+        extracted_pages = await parse_any_file_to_pages(temp_path, client)
+        total_pages = len(extracted_pages)
 
         if total_pages == 0:
             raise HTTPException(status_code=400, detail="Uploaded PDF is empty.")
@@ -47,24 +48,15 @@ async def upload_pdf_session(
         db.pdf_pages.delete_many({"session_id": session_id})
 
         documents_to_insert = []
-        page_1_text = ""
+        page_1_text = extracted_pages[0] if total_pages > 0 else "[Empty Page]"
 
-        for page_idx in range(total_pages):
-            page = doc[page_idx]
-            raw_content = page.get_text("text")
-            clean_text = protect_and_normalize_font(raw_content)
-
-            if page_idx == 0:
-                page_1_text = clean_text
-
+        for page_idx, clean_text in enumerate(extracted_pages):
             documents_to_insert.append({
                 "session_id": session_id,
                 "user_id": firebase_uid,
                 "page_number": page_idx + 1,
                 "content": clean_text
             })
-
-        doc.close()
 
         if documents_to_insert:
             db.pdf_pages.insert_many(documents_to_insert)

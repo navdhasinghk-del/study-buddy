@@ -15,11 +15,7 @@ MODEL_NAME = "gemini-2.5-flash"
 UPLOAD_DIR = "uploads"
 AI_WORKER_URL = os.getenv("AI_WORKER_URL")
 
-class ActiveSession:
-    def __init__(self):
-        self.is_indexing_active: bool = False
-
-session_state = ActiveSession()
+active_indexing_users = set()
 
 SYSTEM_PROMPT = """
 You are a strict academic evaluator. Your job is to answer the question using ONLY the most exact and directly relevant textbook context provided.
@@ -35,7 +31,7 @@ PAGES: [Yahan explicit page numbers likhein jaise context mein diya gaya hai, e.
 
 async def forward_to_worker_for_indexing(file_path: str, firebase_uid: str):
     try:
-        session_state.is_indexing_active = True
+        active_indexing_users.add(firebase_uid)
         texts = await parse_any_file_to_pages(file_path, client)
         texts = [t for t in texts if t.strip() and t != "[Empty Page]"]
         if not texts:
@@ -46,7 +42,7 @@ async def forward_to_worker_for_indexing(file_path: str, firebase_uid: str):
     except Exception as e:
         print(f"Error: {str(e)}")
     finally:
-        session_state.is_indexing_active = False
+        active_indexing_users.discard(firebase_uid)
         if os.path.exists(file_path):
             os.remove(file_path)
 
@@ -96,8 +92,8 @@ async def process_solution(question_file_id: str = Form(...), decoded_token: dic
             file_wait_retry += 1
         if not os.path.exists(q_path):
             raise HTTPException(status_code=404, detail="Question paper file not found.")
-        while session_state.is_indexing_active:
-            await asyncio.sleep(2.0)
+        while firebase_uid in active_indexing_users:
+            await asyncio.sleep(1.0)
         ext = os.path.splitext(q_path)[-1].lower()
         if ext in [".png", ".jpg", ".jpeg", ".webp"]:
             from utils.upload_helpers import process_image_via_vision_ai
@@ -137,11 +133,6 @@ async def process_solution(question_file_id: str = Form(...), decoded_token: dic
     finally:
         if q_path and os.path.exists(q_path):
             os.remove(q_path)
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as httpx_client:
-                await httpx_client.post(f"{AI_WORKER_URL}/clear-vectors?user_id={firebase_uid}")
-        except Exception:
-            pass
 
 @router.post("/flush-session")
 async def flush_session(decoded_token: dict = Depends(verify_firebase_token)):
