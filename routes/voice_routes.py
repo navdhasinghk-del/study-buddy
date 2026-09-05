@@ -1,5 +1,4 @@
 import os
-import io
 import re
 import uuid
 import json
@@ -7,86 +6,116 @@ import shutil
 import asyncio
 import edge_tts
 import httpx
-from typing import List
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
+from typing import List, Optional
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from google import genai
-from google.genai import types
+from groq import AsyncGroq
+from openai import AsyncOpenAI
 from utils.upload_helpers import parse_any_file_to_pages
 from dependencies import verify_firebase_token, get_user_premium_status
 
 router = APIRouter()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-STUDY_BUDDY_ENGINE = "gemini-2.5-flash"
+groq_free_client = AsyncGroq(api_key=os.getenv("GROQ_FREE_API_KEY"))
+groq_premium_client = AsyncGroq(api_key=os.getenv("GROQ_PREMIUM_API_KEY"))
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+GROQ_TEXT_MODEL = "openai/gpt-oss-120b"
+GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
 UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-class QuestionListSchema(BaseModel):
-    questions: List[str]
-
 VOICE_SYSTEM_PROMPT = """
-You are an expert oral exam evaluator. You will receive a Textbook Reference Context, an Evaluation Question, and an Audio File of the user speaking their answer.
-Analyze the user's spoken audio directly. Compare the semantic core meaning of what they said against the provided Reference Context.
-Ignore micro-stutters, natural conversational fillers, background static, or language pronunciation limits.
-You MUST respond strictly in this JSON structure, with absolutely no markdown formatting or extra text:
+You are an expert oral exam evaluator. You will receive a Textbook Reference Context, an Evaluation Question, and the transcribed text of what the student spoke.
+Compare the semantic core meaning of the student's answer against the provided Reference Context.
+Ignore minor grammatical slips, fillers, or pronunciation-based transcription artifacts.
+You MUST respond strictly in valid JSON format with no markdown blocks:
 {
   "percentage": 85,
-  "verdict": "correct" 
+  "verdict": "correct"
 }
-Note: If semantic match is 80% or above, set "verdict": "correct". If below 80%, set "verdict": "retry".
+If semantic match is 75% or above, set "verdict": "correct". If below 75%, set "verdict": "retry".
 """
 
-async def save_supabase_voice_session(user_id: str, context: str, questions: list):
-    async with httpx.AsyncClient(timeout=30.0) as http_client:
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "Content-Type": "application/json",
-            "Prefer": "resolution=merge-duplicates"
+async def generate_gemini_vector(http_client: httpx.AsyncClient, text: str):
+    url = f"{GEMINI_EMBED_URL}?key={GEMINI_API_KEY}"
+    payload = {
+        "model": "models/gemini-embedding-001",
+        "content": {
+            "parts": [{"text": text}]
         }
-        payload = {
-            "user_id": user_id,
-            "full_text_context": context,
-            "questions": questions,
-            "attempted_count": 0
-        }
-        resp = await http_client.post(
-            f"{SUPABASE_URL}/rest/v1/voice_sessions?on_conflict=user_id",
-            headers=headers,
-            json=payload
-        )
-        if resp.status_code not in [200, 201]:
-            print(f"Supabase save error: {resp.text}")
+    }
+    try:
+        response = await http_client.post(url, json=payload, timeout=20.0)
+        if response.status_code == 200:
+            values = response.json().get("embedding", {}).get("values", [])
+            return values, None
+        return [], f"Gemini API Error: HTTP {response.status_code} - {response.text}"
+    except Exception as e:
+        return [], f"Gemini Request Exception: {str(e)}"
 
-async def get_supabase_voice_session(user_id: str) -> dict:
-    async with httpx.AsyncClient(timeout=30.0) as http_client:
-        headers = {
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}"
-        }
-        resp = await http_client.get(
-            f"{SUPABASE_URL}/rest/v1/voice_sessions?user_id=eq.{user_id}&select=*",
-            headers=headers
+async def generate_openai_vector(text: str):
+    try:
+        response = await openai_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text
         )
-        if resp.status_code == 200 and resp.json():
-            return resp.json()[0]
-    return {"full_text_context": "", "attempted_count": 0, "questions": []}
+        return response.data[0].embedding, None
+    except Exception as e:
+        return [], f"OpenAI Embedding Error: {str(e)}"
 
-async def update_voice_attempt(user_id: str, new_count: int):
-    async with httpx.AsyncClient(timeout=30.0) as http_client:
+async def get_embedding_by_tier(http_client: httpx.AsyncClient, text: str, is_premium: bool):
+    if is_premium:
+        return await generate_openai_vector(text)
+    return await generate_gemini_vector(http_client, text)
+
+async def fetch_vector_context(http_client: httpx.AsyncClient, firebase_uid: str, question: str, is_premium: bool):
+    try:
+        clean_q = re.sub(r'\[.*?\]', '', question).strip()
+        query_vector, embed_err = await get_embedding_by_tier(http_client, clean_q, is_premium)
+        if not query_vector:
+            return "", f"Question Embedding Error: {embed_err}"
+
         headers = {
             "apikey": SUPABASE_KEY,
             "Authorization": f"Bearer {SUPABASE_KEY}",
             "Content-Type": "application/json"
         }
-        await http_client.patch(
-            f"{SUPABASE_URL}/rest/v1/voice_sessions?user_id=eq.{user_id}",
+        
+        rpc_function = "match_voice_vectors_premium" if is_premium else "match_voice_vectors_free"
+
+        rpc_payload = {
+            "query_embedding": query_vector,
+            "match_threshold": -1.0,
+            "match_count": 3,
+            "filter_user_id": firebase_uid
+        }
+
+        resp = await http_client.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/{rpc_function}",
             headers=headers,
-            json={"attempted_count": new_count}
+            json=rpc_payload
         )
+
+        if resp.status_code != 200:
+            return "", f"Supabase RPC Error: {resp.text}"
+
+        matches = resp.json()
+        if not matches:
+            return "", "No context matches found in database."
+
+        context_chunks = [item.get("content", "") for item in matches]
+        return "\n\n".join(context_chunks), None
+
+    except Exception as vector_err:
+        return "", f"Vector Search Exception: {str(vector_err)}"
 
 def auto_detect_language_voice(text: str) -> str:
     if re.search(r'[\u0B80-\u0BFF]', text):
@@ -148,56 +177,70 @@ def auto_detect_language_voice(text: str) -> str:
 @router.post("/process-voice-material")
 async def process_voice_material(file: UploadFile = File(...), decoded_token: dict = Depends(verify_firebase_token)):
     firebase_uid = decoded_token["uid"].strip().lower()
+    is_premium = get_user_premium_status(firebase_uid)
+    target_table = "voice_vectors_premium" if is_premium else "voice_vectors_free"
+    selected_groq = groq_premium_client if is_premium else groq_free_client
+
     temp_voice_doc_path = ""
     try:
         clean_name = f"voice_ref_{uuid.uuid4()}_{file.filename.replace(' ', '_')}"
         temp_voice_doc_path = os.path.join(UPLOAD_DIR, clean_name)
         with open(temp_voice_doc_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        ext = os.path.splitext(temp_voice_doc_path)[-1].lower()
         
-        detected_questions = []
-        full_text_context = ""
-        if ext in [".png", ".jpg", ".jpeg", ".webp"]:
-            from utils.upload_helpers import process_image_via_vision_ai
-            detected_questions = await process_image_via_vision_ai(temp_voice_doc_path, client)
-            parsed_pages = await parse_any_file_to_pages(temp_voice_doc_path, client)
-            full_text_context = "\n".join(parsed_pages)
-        else:
-            parsed_pages = await parse_any_file_to_pages(temp_voice_doc_path, client)
-            extracted_text = "\n".join(parsed_pages)
-            if not extracted_text.strip() or extracted_text == "[Empty Page]":
-                raise HTTPException(status_code=400, detail="Document layout completely unreadable.")
-            full_text_context = extracted_text
-            intelligence_prompt = (
-                f"Analyze the following extracted document text content carefully:\n\n"
-                f"{full_text_context}\n\n"
-                f"TASK:\n"
-                f"Identify, reconstruct, and extract a clean list of all logical, academic, or evaluation questions "
-                f"present in this text. If a question is plain or short, capture it exactly. "
-                f"Strictly filter out any metadata, introductory headers, page indices, or background clutter."
-            )
-            loop = asyncio.get_running_loop()
-            ai_response = await loop.run_in_executor(
-                None,
-                lambda: client.models.generate_content(
-                    model=STUDY_BUDDY_ENGINE,
-                    contents=intelligence_prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=QuestionListSchema,
-                        temperature=0.0
-                    ),
+        parsed_pages = await parse_any_file_to_pages(temp_voice_doc_path)
+        valid_pages = []
+        for idx, t in enumerate(parsed_pages):
+            if t.strip() and t != "[Empty Page]":
+                valid_pages.append((idx + 1, t))
+
+        if not valid_pages:
+            raise HTTPException(status_code=400, detail="Document layout completely unreadable.")
+
+        async with httpx.AsyncClient(timeout=60.0) as httpx_client:
+            headers = {
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json"
+            }
+            records = []
+            for page_num, text in valid_pages:
+                embedding, _ = await get_embedding_by_tier(httpx_client, text, is_premium)
+                if embedding:
+                    records.append({
+                        "user_id": firebase_uid,
+                        "page_number": page_num,
+                        "content": text,
+                        "embedding": embedding
+                    })
+
+            if records:
+                await httpx_client.post(
+                    f"{SUPABASE_URL}/rest/v1/{target_table}",
+                    headers=headers,
+                    json=records
                 )
-            )
-            if ai_response.text:
-                parsed_json = json.loads(ai_response.text.strip())
-                detected_questions = parsed_json.get("questions", [])
-                
+
+        full_text_context = "\n".join([t[1] for t in valid_pages])
+        prompt = (
+            f"Analyze the extracted text content carefully:\n\n{full_text_context[:4000]}\n\n"
+            f"Extract all logical academic questions present in this text. Respond STRICTLY in this JSON format: {{\"questions\": [\"Question 1\", \"Question 2\"]}}"
+        )
+        chat_completion = await selected_groq.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "You are a precise JSON extractor. Output valid JSON only."},
+                {"role": "user", "content": prompt}
+            ],
+            model=GROQ_TEXT_MODEL,
+            response_format={"type": "json_object"},
+            temperature=0.0
+        )
+        parsed_json = json.loads(chat_completion.choices[0].message.content.strip())
+        detected_questions = parsed_json.get("questions", [])
+        
         if not detected_questions:
             raise HTTPException(status_code=400, detail="Could not extract questions from document.")
             
-        await save_supabase_voice_session(firebase_uid, full_text_context, detected_questions)
         return {"status": "success", "questions": detected_questions}
     except HTTPException:
         raise
@@ -226,54 +269,64 @@ async def get_study_buddy_tts(text: str, decoded_token: dict = Depends(verify_fi
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/evaluate-audio-recall")
-async def evaluate_audio_recall(question: str = Form(...), file: UploadFile = File(...), decoded_token: dict = Depends(verify_firebase_token)):
+async def evaluate_audio_recall(
+    question: str = Form(...),
+    audio_file: UploadFile = File(...),
+    decoded_token: dict = Depends(verify_firebase_token)
+):
     firebase_uid = decoded_token["uid"].strip().lower()
-    
-    current_session = await get_supabase_voice_session(firebase_uid)
-    attempted_count = current_session.get("attempted_count", 0)
-    
-    if not get_user_premium_status(firebase_uid) and attempted_count >= 2:
-        raise HTTPException(status_code=403, detail="Free Tier Practice Limit Reached. Max 2 questions allowed.")
+    is_premium = get_user_premium_status(firebase_uid)
+    selected_groq = groq_premium_client if is_premium else groq_free_client
 
-    temp_audio_path = ""
-    uploaded_audio_file = None
+    temp_audio_name = f"spoken_{uuid.uuid4()}.m4a"
+    temp_audio_path = os.path.join(UPLOAD_DIR, temp_audio_name)
+
     try:
-        temp_audio_name = f"{uuid.uuid4()}.m4a"
-        temp_audio_path = os.path.join(UPLOAD_DIR, temp_audio_name)
         with open(temp_audio_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        uploaded_audio_file = client.files.upload(file=temp_audio_path)
-        
-        prompt_payload = [
-            uploaded_audio_file,
-            f"TEXTBOOK CONTEXT ENGINE:\n{current_session.get('full_text_context', '')[:4000]}\n\nEVALUATION QUESTION:\n{question}\n"
-        ]
-        response = client.models.generate_content(
-            model=STUDY_BUDDY_ENGINE,
-            contents=prompt_payload,
-            config=types.GenerateContentConfig(
-                system_instruction=VOICE_SYSTEM_PROMPT,
-                temperature=0.0,
-                response_mime_type="application/json"
-            ),
+            shutil.copyfileobj(audio_file.file, buffer)
+
+        with open(temp_audio_path, "rb") as f:
+            transcription = await selected_groq.audio.transcriptions.create(
+                file=(temp_audio_name, f.read()),
+                model=GROQ_WHISPER_MODEL,
+                response_format="json"
+            )
+
+        student_speech = transcription.text.strip()
+        if not student_speech:
+            return {"status": "error", "message": "No audible speech recognized in audio."}
+
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
+            combined_context, _ = await fetch_vector_context(http_client, firebase_uid, question, is_premium)
+
+        eval_prompt = (
+            f"TEXTBOOK CONTEXT:\n{combined_context}\n\n"
+            f"EVALUATION QUESTION:\n{question}\n\n"
+            f"STUDENT SPOKEN ANSWER:\n{student_speech}"
         )
-        evaluation_result = json.loads(response.text)
-        await update_voice_attempt(firebase_uid, attempted_count + 1)
+        
+        eval_resp = await selected_groq.chat.completions.create(
+            messages=[
+                {"role": "system", "content": VOICE_SYSTEM_PROMPT},
+                {"role": "user", "content": eval_prompt}
+            ],
+            model=GROQ_TEXT_MODEL,
+            response_format={"type": "json_object"},
+            temperature=0.0
+        )
+        
+        evaluation_result = json.loads(eval_resp.choices[0].message.content.strip())
         
         return {
             "status": "success",
+            "transcription": student_speech,
             "percentage": evaluation_result.get("percentage", 0),
             "verdict": evaluation_result.get("verdict", "retry")
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
     finally:
-        if uploaded_audio_file:
-            try:
-                client.files.delete(name=uploaded_audio_file.name)
-            except Exception:
-                pass
-        if temp_audio_path and os.path.exists(temp_audio_path):
+        if os.path.exists(temp_audio_path):
             try:
                 os.remove(temp_audio_path)
             except Exception:
@@ -282,13 +335,19 @@ async def evaluate_audio_recall(question: str = Form(...), file: UploadFile = Fi
 @router.post("/flush-voice-session")
 async def flush_voice_session(decoded_token: dict = Depends(verify_firebase_token)):
     firebase_uid = decoded_token["uid"].strip().lower()
+    is_premium = get_user_premium_status(firebase_uid)
+    target_table = "voice_vectors_premium" if is_premium else "voice_vectors_free"
+
     try:
         async with httpx.AsyncClient(timeout=30.0) as http_client:
             headers = {
                 "apikey": SUPABASE_KEY,
                 "Authorization": f"Bearer {SUPABASE_KEY}"
             }
-            await http_client.delete(f"{SUPABASE_URL}/rest/v1/voice_sessions?user_id=eq.{firebase_uid}", headers=headers)
-        return {"status": "success", "message": "Supabase voice session cleared"}
+            await http_client.delete(
+                f"{SUPABASE_URL}/rest/v1/{target_table}?user_id=eq.{firebase_uid}",
+                headers=headers
+            )
+        return {"status": "success", "message": "Supabase vectors flushed for user."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -216,16 +216,6 @@ async def verify_firebase_token(request: Request, authorization: str = Header(No
         elif method == "GET" and any(action in path for action in ["/note/", "/open", "/details"]):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Opening existing notes is a premium feature.")
 
-    elif "/export" in path or "/download" in path:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Exporting or downloading document range is a premium feature.")
-
-    elif "/jump-page" in path:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Direct page jumping is a premium feature.")
-
-    elif "/upload-pdf-session" in path:
-        if not check_and_increment_limit(user_id, "doc_reader_upload", 1):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Daily free limit reached for Document Reader.")
-
     elif "/process-voice-material" in path:
         if not check_and_increment_limit(user_id, "voice_upload", 1):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Daily free limit reached for voice feature.")

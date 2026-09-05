@@ -12,7 +12,6 @@ from routes import (
     download_routes, 
     voice_routes, 
     notepad_routes, 
-    document_routes, 
     referral_routes, 
     demo_routes
 )
@@ -159,7 +158,6 @@ app.include_router(upload_routes.router)
 app.include_router(download_routes.router)
 app.include_router(voice_routes.router)
 app.include_router(notepad_routes.router)
-app.include_router(document_routes.router)
 app.include_router(referral_routes.router)
 app.include_router(demo_routes.router)
 

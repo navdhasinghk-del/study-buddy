@@ -1,21 +1,17 @@
 import os
-import io
 import json
 import traceback
 from datetime import datetime
 from typing import Optional
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form, status
+from fastapi import APIRouter, HTTPException, Request, Form, status
 from fastapi.responses import HTMLResponse, JSONResponse
-import fitz
-from google import genai
-from google.genai import types
-
+from groq import AsyncGroq
 from dependencies import get_postgres_db
 
 router = APIRouter(prefix="/demo", tags=["Demo Portal"])
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-MODEL_NAME = "gemini-2.5-flash"
+groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+GROQ_TEXT_MODEL = "openai/gpt-oss-120b"
 
 def get_client_ip(request: Request) -> str:
     forwarded = request.headers.get("X-Forwarded-For")
@@ -74,6 +70,7 @@ async def serve_demo_ui():
             .feature-card p { margin: 0; font-size: 12px; color: #94a3b8; line-height: 1.4; }
             .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; margin-bottom: 8px; }
             .badge-free { background: #064e3b; color: #34d399; }
+            .badge-native { background: #1e3a5f; color: #38bdf8; }
             .badge-prem { background: #4c1d95; color: #c084fc; }
 
             .playground-card { background: #111827; border: 1px solid #38bdf8; border-radius: 16px; padding: 25px; box-shadow: 0 8px 25px rgba(56,189,248,0.1); }
@@ -81,10 +78,9 @@ async def serve_demo_ui():
             .playground-desc { font-size: 13px; color: #94a3b8; margin-bottom: 20px; }
             
             label { display: block; font-size: 13px; font-weight: 600; color: #cbd5e1; margin-bottom: 6px; }
-            select, textarea, input[type="file"] { width: 100%; background: #080c14; border: 1px solid #334155; color: #f1f5f9; border-radius: 8px; padding: 12px; margin-bottom: 16px; font-size: 14px; outline: none; }
+            select, textarea { width: 100%; background: #080c14; border: 1px solid #334155; color: #f1f5f9; border-radius: 8px; padding: 12px; margin-bottom: 16px; font-size: 14px; outline: none; }
             select:focus, textarea:focus { border-color: #38bdf8; }
             textarea { resize: vertical; min-height: 80px; }
-            .note { font-size: 12px; color: #fbbf24; margin-top: -10px; margin-bottom: 16px; }
             button { width: 100%; background: #0284c7; color: white; border: none; padding: 14px; border-radius: 8px; font-size: 15px; font-weight: bold; cursor: pointer; transition: 0.2s; }
             button:hover { background: #0369a1; }
             button:disabled { background: #334155; cursor: not-allowed; }
@@ -107,9 +103,9 @@ async def serve_demo_ui():
                     <p>Vector search combined with strict context verification for academic textbooks and questions.</p>
                 </div>
                 <div class="feature-card">
-                    <span class="badge badge-free">FREE TIER AVAILABLE</span>
+                    <span class="badge badge-native">ON-DEVICE (CLIENT-SIDE)</span>
                     <h3>2. Document Reader</h3>
-                    <p>Instant PDF page text extraction, font normalization, and fast memory indexing (Max 10MB free).</p>
+                    <p>Native Android PDF rendering, local slicing, and Devanagari ML Kit OCR with zero backend load.</p>
                 </div>
                 <div class="feature-card">
                     <span class="badge badge-free">FREE TIER AVAILABLE</span>
@@ -123,8 +119,8 @@ async def serve_demo_ui():
                 </div>
                 <div class="feature-card">
                     <span class="badge badge-prem">APP EXCLUSIVE (PREMIUM)</span>
-                    <h3>5. Vector PDF Segment Export</h3>
-                    <p>Dynamic page-range extraction and custom PDF re-compilation directly from the cloud.</p>
+                    <h3>5. Vector PDF Export</h3>
+                    <p>Dynamic evaluation report generation and custom PDF re-compilation directly from the cloud.</p>
                 </div>
                 <div class="feature-card">
                     <span class="badge badge-prem">APP EXCLUSIVE (PREMIUM)</span>
@@ -135,13 +131,12 @@ async def serve_demo_ui():
 
             <div class="playground-card">
                 <h2>Live Free Tier Playground</h2>
-                <div class="playground-desc">Test free features directly. Enforced limit: 1 request / feature / day per IP.</div>
+                <div class="playground-desc">Test free backend features directly. Enforced limit: 1 request / feature / day per IP.</div>
                 
                 <label for="feature">Select Feature To Test:</label>
                 <select id="feature" onchange="renderForm()">
                     <option value="qa_workspace">1. AI Q&A Workspace (Context + Question)</option>
-                    <option value="doc_reader">2. Document Reader (PDF Upload & Preview)</option>
-                    <option value="voice_evaluator">3. Voice Recall Evaluator (Simulated Oral Exam)</option>
+                    <option value="voice_evaluator">2. Voice Recall Evaluator (Simulated Oral Exam)</option>
                 </select>
 
                 <div id="dynamic-inputs"></div>
@@ -163,12 +158,6 @@ async def serve_demo_ui():
                         <textarea id="ctx" placeholder="Paste textbook context here..."></textarea>
                         <label>Target Question:</label>
                         <textarea id="q" style="min-height:50px;" placeholder="Ask specific question based on above text..."></textarea>
-                    `;
-                } else if (feat === 'doc_reader') {
-                    html = `
-                        <label>Upload PDF Document (Max 10MB):</label>
-                        <input type="file" id="pdfFile" accept=".pdf,application/pdf" />
-                        <div class="note">Extracts metadata and previews Page 1 clean text.</div>
                     `;
                 } else if (feat === 'voice_evaluator') {
                     html = `
@@ -198,32 +187,20 @@ async def serve_demo_ui():
                 const formData = new FormData();
                 formData.append("feature_name", feat);
 
-                if (feat === 'doc_reader') {
-                    const fileInput = document.getElementById('pdfFile');
-                    if (!fileInput.files || fileInput.files.length === 0) {
-                        alert("Please select a PDF file first.");
-                        btn.disabled = false;
-                        btn.innerText = "Run Feature Demo";
-                        resBox.style.display = "none";
-                        return;
-                    }
-                    formData.append("file", fileInput.files[0]);
-                } else {
-                    const ctx = document.getElementById('ctx') ? document.getElementById('ctx').value.trim() : '';
-                    const q = document.getElementById('q') ? document.getElementById('q').value.trim() : '';
-                    const voiceText = document.getElementById('voiceText') ? document.getElementById('voiceText').value.trim() : '';
-                    
-                    if (!ctx) {
-                        alert("Context text is required.");
-                        btn.disabled = false;
-                        btn.innerText = "Run Feature Demo";
-                        resBox.style.display = "none";
-                        return;
-                    }
-                    formData.append("context", ctx);
-                    formData.append("question", q);
-                    formData.append("spoken_text", voiceText);
+                const ctx = document.getElementById('ctx') ? document.getElementById('ctx').value.trim() : '';
+                const q = document.getElementById('q') ? document.getElementById('q').value.trim() : '';
+                const voiceText = document.getElementById('voiceText') ? document.getElementById('voiceText').value.trim() : '';
+                
+                if (!ctx) {
+                    alert("Context text is required.");
+                    btn.disabled = false;
+                    btn.innerText = "Run Feature Demo";
+                    resBox.style.display = "none";
+                    return;
                 }
+                formData.append("context", ctx);
+                formData.append("question", q);
+                formData.append("spoken_text", voiceText);
 
                 try {
                     const resp = await fetch("/demo/execute", {
@@ -268,8 +245,7 @@ async def execute_demo_feature(
     feature_name: str = Form(...),
     context: Optional[str] = Form(None),
     question: Optional[str] = Form(None),
-    spoken_text: Optional[str] = Form(None),
-    file: Optional[UploadFile] = File(None)
+    spoken_text: Optional[str] = Form(None)
 ):
     client_ip = get_client_ip(request)
 
@@ -291,43 +267,20 @@ async def execute_demo_feature(
                 "You are a strict academic evaluator. Answer the question using ONLY the context provided. "
                 "Follow format: QUESTION: [q] | ANSWER: [ans] | PAGES: N/A"
             )
-            resp = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=f"CONTEXT:\n{context}\n\nQUESTION:\n{question}",
-                config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.0)
+            resp = await groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"CONTEXT:\n{context}\n\nQUESTION:\n{question}"}
+                ],
+                model=GROQ_TEXT_MODEL,
+                temperature=0.0
             )
             return JSONResponse(
                 status_code=200,
                 content={
                     "status": "success",
                     "feature": "AI Q&A Workspace",
-                    "result": resp.text.strip() if resp.text else "No answer generated."
-                }
-            )
-
-        elif feature_name == "doc_reader":
-            if not file:
-                return JSONResponse(status_code=400, content={"detail": "PDF File is required."})
-            if not file.filename.lower().endswith(".pdf"):
-                return JSONResponse(status_code=400, content={"detail": "Only PDF format allowed."})
-
-            file_bytes = await file.read()
-            if len(file_bytes) > 10 * 1024 * 1024:
-                return JSONResponse(status_code=403, content={"detail": "Free Tier limit: PDF size exceeds 10MB."})
-
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            total_pages = len(doc)
-            p1_text = doc[0].get_text("text").strip() if total_pages > 0 else ""
-            doc.close()
-
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "status": "success",
-                    "feature": "Document Reader",
-                    "filename": file.filename,
-                    "total_pages": total_pages,
-                    "page_1_preview": p1_text[:600] if p1_text else "[Empty or Image-based PDF]"
+                    "result": resp.choices[0].message.content.strip()
                 }
             )
 
@@ -342,12 +295,16 @@ async def execute_demo_feature(
                 f"Student Spoken Response: {spoken_text}\n\n"
                 f"Evaluate semantic accuracy and return strictly JSON: {{\"percentage\": 85, \"verdict\": \"correct\" or \"retry\"}}"
             )
-            resp = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.0, response_mime_type="application/json")
+            resp = await groq_client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "Output valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                model=GROQ_TEXT_MODEL,
+                response_format={"type": "json_object"},
+                temperature=0.0
             )
-            evaluation_data = json.loads(resp.text) if resp.text else {"percentage": 0, "verdict": "retry"}
+            evaluation_data = json.loads(resp.choices[0].message.content.strip())
             return JSONResponse(
                 status_code=200,
                 content={

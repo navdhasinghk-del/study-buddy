@@ -1,81 +1,49 @@
 import os
+import json
 import tempfile
 import traceback
-from typing import Optional
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from utils.pdf_export import export_pdf_from_vectors
-from dependencies import verify_firebase_token
+from utils.pdf_export import generate_evaluation_report_pdf
 
 router = APIRouter()
 
-class PDFRangeRequest(BaseModel):
-    start_page: Optional[int] = None
-    end_page: Optional[int] = None
-    current_page: Optional[int] = None  # Accepts ANY dynamic page number chosen by user (1, 20, 50, etc.)
-
-
-@router.post("/export-range")
-async def export_pdf_range(
-    data: PDFRangeRequest,
-    decoded_token: dict = Depends(verify_firebase_token)
-):
+@router.post("/download")
+async def download_evaluation_report(request: Request):
     try:
-        firebase_uid = decoded_token["uid"].strip().lower()
-        session_id = f"session_{firebase_uid}"
+        raw_body = await request.body()
+        raw_text = raw_body.decode("utf-8", errors="ignore")
+        
+        report_text = ""
+        include_pages_flag = True
 
-        # 1. DYNAMIC PAGE LOGIC HANDLING
-        # Mode A: User wants to download ONLY the active current page (e.g., page 20)
-        if data.current_page is not None:
-            target_start = data.current_page
-            target_end = data.current_page
-            export_filename = f"exported_page_{data.current_page}.pdf"
-            
-        # Mode B: User selected a custom page range (e.g., page 10 to page 25)
-        elif data.start_page is not None and data.end_page is not None:
-            target_start = data.start_page
-            target_end = data.end_page
-            export_filename = f"exported_pages_{data.start_page}_to_{data.end_page}.pdf"
-            
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid payload: Provide either 'current_page' OR both 'start_page' and 'end_page'."
-            )
+        if raw_text.strip():
+            try:
+                data = json.loads(raw_text)
+                report_text = data.get("answer") or data.get("content") or data.get("text") or ""
+                if "include_pages" in data:
+                    include_pages_flag = bool(data["include_pages"])
+            except Exception:
+                report_text = raw_text
 
-        temp_pdf = tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=".pdf"
-        )
+        if not report_text.strip() or report_text == "No context data available":
+            report_text = "Study Buddy Evaluation Report\n\nNo evaluation content found."
+
+        temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
         temp_pdf.close()
 
-        # 2. Fetch pages dynamically from MongoDB and generate PDF
-        pdf_path = export_pdf_from_vectors(
-            session_id=session_id,
-            user_id=firebase_uid,
-            start_page=target_start,
-            end_page=target_end,
-            output_path=temp_pdf.name
+        pdf_path = generate_evaluation_report_pdf(
+            content_text=report_text,
+            output_path=temp_pdf.name,
+            include_page_numbers=include_pages_flag
         )
-
-        if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
-            raise HTTPException(
-                status_code=500,
-                detail="Vector PDF segment compilation failed."
-            )
 
         return FileResponse(
             path=pdf_path,
             media_type="application/pdf",
-            filename=export_filename
+            filename="Study_Buddy_Solution.pdf"
         )
 
-    except HTTPException as http_ex:
-        raise http_ex
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Export Pipeline Exception: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"PDF Download Error: {str(e)}")

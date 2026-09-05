@@ -3,18 +3,14 @@ import io
 import re
 import fitz
 import json
+import base64
 import asyncio
 import unicodedata
+import httpx
 from typing import List
-from pydantic import BaseModel, Field
-from google.genai import types
+from groq import AsyncGroq
 
-MODEL_NAME = "gemini-2.5-flash"
-
-class ExtractedQuestions(BaseModel):
-    questions: List[str] = Field(
-        description="List of fully reconstructed academic or evaluation questions. UI elements, page numbers, and filenames must be strictly excluded."
-    )
+OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "")
 
 KRUTI_DEV_MAPPINGS = {
     "k": "ा", "d": "क", "f": "ि", "g": "ह", "h": "ी", "j": "र",
@@ -48,102 +44,51 @@ def is_scrambled_legacy_font(text: str) -> bool:
 def protect_and_normalize_font(text_stream: str) -> str:
     if not text_stream or text_stream.strip() == "[Empty Page]":
         return "[Empty Page]"
-    
     if is_scrambled_legacy_font(text_stream):
         text_stream = decode_kruti_dev_text(text_stream)
-        
     normalized_text = unicodedata.normalize('NFC', text_stream)
     if "cid:" in normalized_text or "unknown:" in normalized_text:
         return "[Empty Page]"
-        
     lines = normalized_text.split("\n")
-    valid_chunks = []
-    
-    for line in lines:
-        clean_line = line.strip()
-        if clean_line:
-            valid_chunks.append(clean_line)
-            
+    valid_chunks = [line.strip() for line in lines if line.strip()]
     final_output = "\n".join(valid_chunks)
     if not final_output.strip() or len(final_output.strip()) < 5:
         return "[Empty Page]"
-        
     return final_output
 
 def extract_clean_blocks_from_page(page: fitz.Page) -> str:
     try:
         blocks = page.get_text("blocks")
         blocks = sorted(blocks, key=lambda b: (b[1], b[0]))
-        text_chunks = []
-        for b in blocks:
-            text = b[4].strip()
-            if text:
-                text_chunks.append(text)
+        text_chunks = [b[4].strip() for b in blocks if b[4].strip()]
         return "\n\n".join(text_chunks)
     except Exception:
         return page.get_text()
 
-async def extract_text_via_gemini_ocr(page: fitz.Page, client) -> str:
-    try:
-        zoom = 2
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat)
-        img_data = pix.tobytes("png")
-        
-        image_part = types.Part.from_bytes(
-            data=img_data,
-            mime_type="image/png"
-        )
-        
-        ocr_prompt = (
-            "Extract all readable text from this image page in clean Unicode Hindi (Devanagari) or English. "
-            "Preserve matras, conjunct characters, layout structure, and paragraphs exactly. "
-            "Do not omit Hindi words or characters. Do not add any commentary, just return the extracted text."
-        )
-        
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: client.models.generate_content(
-                model=MODEL_NAME,
-                contents=[image_part, ocr_prompt]
-            )
-        )
-        return response.text.strip() if response.text else "[Empty Page]"
-    except Exception:
+async def extract_text_via_ocr_space(img_bytes: bytes) -> str:
+    if not OCR_SPACE_API_KEY:
         return "[Empty Page]"
-
-async def extract_direct_image_file(file_path: str, client) -> str:
     try:
-        with open(file_path, "rb") as f:
-            img_data = f.read()
-            
-        ext = os.path.splitext(file_path)[-1].lower().replace(".", "")
-        mime_type = f"image/{ext}" if ext in ["png", "jpeg", "jpg", "webp"] else "image/png"
-        
-        image_part = types.Part.from_bytes(
-            data=img_data,
-            mime_type=mime_type
-        )
-        
-        ocr_prompt = (
-            "Extract all readable text from this document image in clean Unicode Hindi or English. "
-            "Maintain complete sentences, Hindi matras, and paragraph structure. Return only the extracted text."
-        )
-        
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: client.models.generate_content(
-                model=MODEL_NAME,
-                contents=[image_part, ocr_prompt]
-            )
-        )
-        return response.text.strip() if response.text else "[Empty Page]"
+        url = "https://api.ocr.space/parse/image"
+        files = {"file": ("page.png", img_bytes, "image/png")}
+        data = {
+            "apikey": OCR_SPACE_API_KEY,
+            "language": "hin",
+            "isOverlayRequired": False,
+            "OCREngine": "2"
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, files=files, data=data)
+            if resp.status_code == 200:
+                res_data = resp.json()
+                parsed = res_data.get("ParsedResults", [])
+                if parsed:
+                    return parsed[0].get("ParsedText", "").strip()
     except Exception:
-        return "[Empty Page]"
+        pass
+    return "[Empty Page]"
 
-async def parse_any_file_to_pages(file_path: str, client) -> List[str]:
+async def parse_any_file_to_pages(file_path: str) -> List[str]:
     ext = os.path.splitext(file_path)[-1].lower()
     pages_text = []
     
@@ -152,25 +97,24 @@ async def parse_any_file_to_pages(file_path: str, client) -> List[str]:
         for page_num in range(len(doc)):
             page = doc[page_num]
             content = extract_clean_blocks_from_page(page)
-            
             if is_scrambled_legacy_font(content) or not content.strip() or len(content.strip()) < 15:
-                ocr_result = await extract_text_via_gemini_ocr(page, client)
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                img_data = pix.tobytes("png")
+                ocr_result = await extract_text_via_ocr_space(img_data)
                 text_content = protect_and_normalize_font(ocr_result)
             else:
                 text_content = protect_and_normalize_font(content)
-                
             pages_text.append(text_content)
         doc.close()
-        
     elif ext in [".png", ".jpg", ".jpeg", ".webp"]:
-        raw_text = await extract_direct_image_file(file_path, client)
-        pages_text.append(protect_and_normalize_font(raw_text))
-        
+        with open(file_path, "rb") as f:
+            img_data = f.read()
+        ocr_result = await extract_text_via_ocr_space(img_data)
+        pages_text.append(protect_and_normalize_font(ocr_result))
     elif ext == ".txt":
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             raw_text = f.read()
         pages_text.append(protect_and_normalize_font(raw_text))
-        
     else:
         try:
             doc = fitz.open(file_path)
@@ -183,78 +127,86 @@ async def parse_any_file_to_pages(file_path: str, client) -> List[str]:
                 
     return [p if p.strip() else "[Empty Page]" for p in pages_text]
 
-async def process_image_via_vision_ai(file_path: str, client) -> list:
-    try:
-        with open(file_path, "rb") as f:
-            img_data = f.read()
-            
-        ext = os.path.splitext(file_path)[-1].lower().replace(".", "")
-        mime_type = f"image/{ext}" if ext in ["png", "jpeg", "jpg", "webp"] else "image/png"
-        
-        image_part = types.Part.from_bytes(
-            data=img_data,
-            mime_type=mime_type
-        )
-        
-        vision_prompt = (
-            "Analyze this screenshot or document image carefully.\n\n"
-            "TASK:\n"
-            "Identify and extract ONLY the actual academic, logical, or evaluation questions present in the main content area.\n\n"
-            "STRICT CRITERIA:\n"
-            "- If a single question is broken down into multiple lines or has arbitrary line breaks due to layout, "
-            "you MUST intelligently merge them into one single continuous string sequence.\n"
-            "- Completely IGNORE and FILTER OUT all user interface elements, application headers, top action bars, back arrows, "
-            "search icons, file names, page counters, and bottom navigation dock icons.\n"
-            "- Do not include raw layout artifacts."
-        )
-        
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: client.models.generate_content(
-                model=MODEL_NAME,
-                contents=[image_part, vision_prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ExtractedQuestions,
-                    temperature=0.0
-                )
-            )
-        )
-        
-        if response.text:
-            cleaned_json = json.loads(response.text.strip())
-            return cleaned_json.get("questions", [])
-        return []
-    except Exception:
+async def smart_exam_question_parser(raw_pages: list, is_premium: bool = False) -> list:
+    full_text = "\n\n".join([p for p in raw_pages if p != "[Empty Page]"])
+    if not full_text.strip():
         return []
 
-def smart_question_sanitizer(raw_pages: list) -> list:
+    if is_premium:
+        selected_key = os.getenv("GROQ_PREMIUM_API_KEY") or os.getenv("GROQ_API_KEY")
+    else:
+        selected_key = os.getenv("GROQ_FREE_API_KEY") or os.getenv("GROQ_API_KEY")
+
+    if not selected_key:
+        return smart_fallback_sanitizer(raw_pages)
+
+    prompt = f"""
+You are an intelligent Exam Paper and Question Extractor.
+Analyze the following document text and extract all standalone evaluation questions:
+
+DOCUMENT CONTENT:
+\"\"\"{full_text[:12000]}\"\"\"
+
+STRICT RULES:
+1. FILTER OUT METADATA: Ignore time limits, maximum marks header, roll number fields, general exam instructions, and section headers (e.g. 'समय', 'पूर्णांक', 'निर्देश', 'खण्ड-अ').
+2. EXTRACT EVERY QUESTION & 'अथवा' (OR) OPTION: Extract main questions as well as 'अथवा' / OR alternative questions as separate, independent items.
+3. DYNAMIC MARKS & LENGTH MAPPING:
+   - If instructions specify word limits or marks for a question (e.g., '2 अंक, शब्द सीमा 30 शब्द', '5 अंक, शब्द सीमा 150 शब्द', '1 अंक / वस्तुनिष्ठ'), tag it at the end like: [Limit: 30 words, 2 Marks] or [Type: 1 Mark Objective].
+   - If NO exam limits/marks exist in the paper (simple question list), do NOT attach any limit tag.
+4. LANGUAGE: Keep the exact original language, script, and spelling of the questions without translating.
+
+Return strictly valid JSON only:
+{{
+  "questions": [
+    "राज्य शब्द का प्रयोग सर्वप्रथम किसने किया? [Type: 1 Mark Objective]"
+  ]
+}}
+"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as http_client:
+            client = AsyncGroq(api_key=selected_key, http_client=http_client)
+            completion = await client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": "You are a precise academic question parser. Output valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                model="openai/gpt-oss-120b",
+                response_format={"type": "json_object"},
+                temperature=0.0
+            )
+            parsed = json.loads(completion.choices[0].message.content.strip())
+            extracted = parsed.get("questions", [])
+            if extracted:
+                return extracted
+    except Exception as e:
+        print(f"[Smart Parser Fallback Triggered]: {str(e)}")
+
+    return smart_fallback_sanitizer(raw_pages)
+
+def smart_fallback_sanitizer(raw_pages: list) -> list:
     compiled_questions = []
-    
-    full_text_stream = ""
-    for page_text in raw_pages:
-        if page_text and page_text != "[Empty Page]":
-            full_text_stream += page_text + "\n"
-            
+    full_text_stream = "\n".join([p for p in raw_pages if p and p != "[Empty Page]"])
     lines = full_text_stream.split("\n")
-    current_question_buffer = []
-    
+    current_buffer = []
     for line in lines:
-        clean_line = line.strip()
-        if not clean_line:
+        clean = line.strip()
+        if not clean or any(clean.startswith(ignore) for ignore in ["निर्देश", "समय", "पूर्णांक", "कक्षा", "खण्ड"]):
             continue
-            
-        current_question_buffer.append(clean_line)
-        if clean_line.endswith("?") or clean_line.endswith("।"):
-            combined_q = " ".join(current_question_buffer).strip()
-            if combined_q and len(combined_q) > 5:
-                compiled_questions.append(combined_q)
-            current_question_buffer = []
-            
-    if current_question_buffer:
-        combined_q = " ".join(current_question_buffer).strip()
-        if combined_q and len(combined_q) > 5:
-            compiled_questions.append(combined_q)
-            
+        current_buffer.append(clean)
+        if clean.endswith("?") or clean.endswith("।") or clean.endswith(":"):
+            q = " ".join(current_buffer).strip()
+            if len(q) > 6:
+                compiled_questions.append(q)
+            current_buffer = []
+    if current_buffer:
+        q = " ".join(current_buffer).strip()
+        if len(q) > 6:
+            compiled_questions.append(q)
     return compiled_questions
+
+async def process_image_via_vision_ai(file_path: str, is_premium: bool = False) -> list:
+    pages = await parse_any_file_to_pages(file_path)
+    return await smart_exam_question_parser(pages, is_premium=is_premium)
+
+def smart_question_sanitizer(raw_pages: list) -> list:
+    return smart_fallback_sanitizer(raw_pages)
