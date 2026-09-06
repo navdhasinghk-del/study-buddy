@@ -9,6 +9,8 @@ firebase-admin
 google-genai
 httpx
 PyMuPDF
-edge-tts
 Pillow
 reportlab
+groq
+openai
+edge-tts
