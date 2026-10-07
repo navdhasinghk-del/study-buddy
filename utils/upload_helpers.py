@@ -56,14 +56,27 @@ def protect_and_normalize_font(text_stream: str) -> str:
         return "[Empty Page]"
     return final_output
 
-def extract_clean_blocks_from_page(page: fitz.Page) -> str:
+def extract_layer1_direct_code(page: fitz.Page) -> str:
+    try:
+        raw_text = page.get_text("text")
+        clean_text = raw_text.strip()
+        if len(clean_text) >= 20 and not is_scrambled_legacy_font(clean_text):
+            return clean_text
+    except Exception:
+        pass
+    return ""
+
+def extract_layer2_layout_blocks(page: fitz.Page) -> str:
     try:
         blocks = page.get_text("blocks")
         blocks = sorted(blocks, key=lambda b: (b[1], b[0]))
         text_chunks = [b[4].strip() for b in blocks if b[4].strip()]
-        return "\n\n".join(text_chunks)
+        combined = "\n\n".join(text_chunks).strip()
+        if len(combined) >= 20 and not is_scrambled_legacy_font(combined):
+            return combined
     except Exception:
-        return page.get_text()
+        pass
+    return ""
 
 async def extract_text_via_ocr_space(img_bytes: bytes) -> str:
     if not OCR_SPACE_API_KEY:
@@ -96,15 +109,22 @@ async def parse_any_file_to_pages(file_path: str) -> List[str]:
         doc = fitz.open(file_path)
         for page_num in range(len(doc)):
             page = doc[page_num]
-            content = extract_clean_blocks_from_page(page)
-            if is_scrambled_legacy_font(content) or not content.strip() or len(content.strip()) < 15:
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img_data = pix.tobytes("png")
-                ocr_result = await extract_text_via_ocr_space(img_data)
-                text_content = protect_and_normalize_font(ocr_result)
-            else:
-                text_content = protect_and_normalize_font(content)
-            pages_text.append(text_content)
+            
+            l1_text = extract_layer1_direct_code(page)
+            if l1_text:
+                pages_text.append(protect_and_normalize_font(l1_text))
+                continue
+                
+            l2_text = extract_layer2_layout_blocks(page)
+            if l2_text:
+                pages_text.append(protect_and_normalize_font(l2_text))
+                continue
+                
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img_data = pix.tobytes("png")
+            ocr_result = await extract_text_via_ocr_space(img_data)
+            pages_text.append(protect_and_normalize_font(ocr_result))
+            
         doc.close()
     elif ext in [".png", ".jpg", ".jpeg", ".webp"]:
         with open(file_path, "rb") as f:
@@ -119,7 +139,14 @@ async def parse_any_file_to_pages(file_path: str) -> List[str]:
         try:
             doc = fitz.open(file_path)
             for page in doc:
-                pages_text.append(protect_and_normalize_font(extract_clean_blocks_from_page(page)))
+                txt = extract_layer1_direct_code(page) or extract_layer2_layout_blocks(page)
+                if txt:
+                    pages_text.append(protect_and_normalize_font(txt))
+                else:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    img_data = pix.tobytes("png")
+                    ocr_result = await extract_text_via_ocr_space(img_data)
+                    pages_text.append(protect_and_normalize_font(ocr_result))
             doc.close()
         except Exception:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -179,7 +206,7 @@ Return strictly valid JSON only:
             if extracted:
                 return extracted
     except Exception as e:
-        print(f"[Smart Parser Fallback Triggered]: {str(e)}")
+        pass
 
     return smart_fallback_sanitizer(raw_pages)
 

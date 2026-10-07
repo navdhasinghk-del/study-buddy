@@ -2,14 +2,21 @@ import os
 import json
 import tempfile
 import traceback
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 from fastapi.responses import FileResponse
 from utils.pdf_export import generate_evaluation_report_pdf
 
 router = APIRouter()
 
+def remove_temp_file(file_path: str):
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+
 @router.post("/download")
-async def download_evaluation_report(request: Request):
+async def download_evaluation_report(request: Request, background_tasks: BackgroundTasks):
     try:
         raw_body = await request.body()
         raw_text = raw_body.decode("utf-8", errors="ignore")
@@ -37,6 +44,12 @@ async def download_evaluation_report(request: Request):
             output_path=temp_pdf.name,
             include_page_numbers=include_pages_flag
         )
+
+        del raw_body
+        del raw_text
+        del report_text
+
+        background_tasks.add_task(remove_temp_file, pdf_path)
 
         return FileResponse(
             path=pdf_path,

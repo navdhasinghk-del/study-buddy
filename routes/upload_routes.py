@@ -1,5 +1,6 @@
 import os
 import re
+import uuid
 import asyncio
 import shutil
 import traceback
@@ -90,7 +91,6 @@ async def forward_to_worker_for_indexing(file_path: str, firebase_uid: str, is_p
                 valid_pages.append((idx + 1, t))
 
         if not valid_pages:
-            print(f"[Indexing Diagnostic] No text extracted from: {file_path}")
             return
 
         target_table = "textbook_vectors_premium" if is_premium else "textbook_vectors_free"
@@ -112,19 +112,16 @@ async def forward_to_worker_for_indexing(file_path: str, firebase_uid: str, is_p
                         "content": text,
                         "embedding": embedding
                     })
-                else:
-                    print(f"[Indexing Embedding Fail Page {page_num}]: {err}")
 
             if records:
-                resp = await httpx_client.post(
+                await httpx_client.post(
                     f"{SUPABASE_URL}/rest/v1/{target_table}",
                     headers=headers,
                     json=records
                 )
-                print(f"[Indexing DB Insert Status]: HTTP {resp.status_code}")
 
     except Exception as e:
-        print(f"[Indexing Exception Diagnostic] {str(e)}")
+        pass
     finally:
         active_indexing_users.discard(firebase_uid)
         if os.path.exists(file_path):
@@ -151,7 +148,9 @@ async def handle_upload(
             raise HTTPException(status_code=403, detail="Free Tier Limit Reached. File size exceeds 10MB limit.")
 
     try:
-        clean_name = os.path.basename(filename).replace(" ", "_")
+        file_ext = os.path.splitext(filename)[1]
+        base_clean = os.path.splitext(os.path.basename(filename))[0].replace(" ", "_")
+        clean_name = f"{firebase_uid}_{uuid.uuid4().hex[:6]}_{base_clean}{file_ext}"
         path = os.path.join(UPLOAD_DIR, clean_name)
         with open(path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
@@ -212,28 +211,29 @@ async def fetch_vector_context(http_client: httpx.AsyncClient, firebase_uid: str
     except Exception as vector_err:
         return None, f"[Callback: Vector Fetch Exception -> {str(vector_err)}]"
 
-async def evaluate_single_question_parallel(http_client: httpx.AsyncClient, firebase_uid: str, q: str, is_premium: bool) -> str:
-    clean_q = re.sub(r'\[.*?\]', '', q).strip()
-    combined_context, error_msg = await fetch_vector_context(http_client, firebase_uid, q, is_premium)
-    
-    if error_msg or not combined_context:
-        return f"QUESTION: {clean_q}\nANSWER: {error_msg}\nPAGES: N/A"
+async def evaluate_single_question_parallel(http_client: httpx.AsyncClient, firebase_uid: str, q: str, is_premium: bool, semaphore: asyncio.Semaphore) -> str:
+    async with semaphore:
+        clean_q = re.sub(r'\[.*?\]', '', q).strip()
+        combined_context, error_msg = await fetch_vector_context(http_client, firebase_uid, q, is_premium)
         
-    prompt_content = f"TEXTBOOK CONTEXT:\n{combined_context}\n\nTARGET QUESTION STATEMENT & INSTRUCTION:\n{q}"
-    selected_groq = groq_premium_client if is_premium else groq_free_client
+        if error_msg or not combined_context:
+            return f"QUESTION: {clean_q}\nANSWER: {error_msg}\nPAGES: N/A"
+            
+        prompt_content = f"TEXTBOOK CONTEXT:\n{combined_context}\n\nTARGET QUESTION STATEMENT & INSTRUCTION:\n{q}"
+        selected_groq = groq_premium_client if is_premium else groq_free_client
 
-    try:
-        response = await selected_groq.chat.completions.create(
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt_content}
-            ],
-            model=GROQ_TEXT_MODEL,
-            temperature=0.0
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as groq_err:
-        return f"QUESTION: {clean_q}\nANSWER: [Callback: Groq Execution Error -> {str(groq_err)}]\nPAGES: N/A"
+        try:
+            response = await selected_groq.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt_content}
+                ],
+                model=GROQ_TEXT_MODEL,
+                temperature=0.0
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as groq_err:
+            return f"QUESTION: {clean_q}\nANSWER: [Callback: Groq Execution Error -> {str(groq_err)}]\nPAGES: N/A"
 
 def find_target_question_file(raw_id: str) -> str:
     if not raw_id:
@@ -282,8 +282,10 @@ async def process_solution(
                 status_code=200
             )
             
-        while firebase_uid in active_indexing_users:
+        wait_limit = 120
+        while firebase_uid in active_indexing_users and wait_limit > 0:
             await asyncio.sleep(1.0)
+            wait_limit -= 1
             
         ext = os.path.splitext(q_path)[-1].lower()
         if ext in [".png", ".jpg", ".jpeg", ".webp"]:
@@ -295,8 +297,13 @@ async def process_solution(
         if not questions:
             return {"status": "success", "answer": "No valid questions found to process."}
 
-        async with httpx.AsyncClient(timeout=45.0) as http_client:
-            tasks = [evaluate_single_question_parallel(http_client, firebase_uid, q, is_premium) for q in questions]
+        semaphore = asyncio.Semaphore(10)
+
+        async with httpx.AsyncClient(timeout=60.0) as http_client:
+            tasks = [
+                evaluate_single_question_parallel(http_client, firebase_uid, q, is_premium, semaphore) 
+                for q in questions
+            ]
             results = await asyncio.gather(*tasks)
 
         return {"status": "success", "answer": "\n\n---\n\n".join(results)}

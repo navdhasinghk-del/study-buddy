@@ -9,7 +9,6 @@ import httpx
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 from groq import AsyncGroq
 from openai import AsyncOpenAI
 from utils.upload_helpers import parse_any_file_to_pages
@@ -48,9 +47,7 @@ async def generate_gemini_vector(http_client: httpx.AsyncClient, text: str):
     url = f"{GEMINI_EMBED_URL}?key={GEMINI_API_KEY}"
     payload = {
         "model": "models/gemini-embedding-001",
-        "content": {
-            "parts": [{"text": text}]
-        }
+        "content": {"parts": [{"text": text}]}
     }
     try:
         response = await http_client.post(url, json=payload, timeout=20.0)
@@ -203,6 +200,12 @@ async def process_voice_material(file: UploadFile = File(...), decoded_token: di
                 "Authorization": f"Bearer {SUPABASE_KEY}",
                 "Content-Type": "application/json"
             }
+            
+            await httpx_client.delete(
+                f"{SUPABASE_URL}/rest/v1/{target_table}?user_id=eq.{firebase_uid}",
+                headers=headers
+            )
+
             records = []
             for page_num, text in valid_pages:
                 embedding, _ = await get_embedding_by_tier(httpx_client, text, is_premium)
@@ -240,6 +243,25 @@ async def process_voice_material(file: UploadFile = File(...), decoded_token: di
         
         if not detected_questions:
             raise HTTPException(status_code=400, detail="Could not extract questions from document.")
+
+        async with httpx.AsyncClient(timeout=30.0) as httpx_client:
+            headers = {
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json"
+            }
+            dummy_vector = [0.0] * (1536 if is_premium else 768)
+            questions_record = [{
+                "user_id": firebase_uid,
+                "page_number": 0,
+                "content": json.dumps(detected_questions),
+                "embedding": dummy_vector
+            }]
+            await httpx_client.post(
+                f"{SUPABASE_URL}/rest/v1/{target_table}",
+                headers=headers,
+                json=questions_record
+            )
             
         return {"status": "success", "questions": detected_questions}
     except HTTPException:
@@ -270,13 +292,35 @@ async def get_study_buddy_tts(text: str, decoded_token: dict = Depends(verify_fi
 
 @router.post("/evaluate-audio-recall")
 async def evaluate_audio_recall(
-    question: str = Form(...),
+    question_index: int = Form(...),
     audio_file: UploadFile = File(...),
     decoded_token: dict = Depends(verify_firebase_token)
 ):
     firebase_uid = decoded_token["uid"].strip().lower()
     is_premium = get_user_premium_status(firebase_uid)
+    target_table = "voice_vectors_premium" if is_premium else "voice_vectors_free"
     selected_groq = groq_premium_client if is_premium else groq_free_client
+
+    target_question = None
+
+    async with httpx.AsyncClient(timeout=15.0) as http_client:
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}"
+        }
+        res = await http_client.get(
+            f"{SUPABASE_URL}/rest/v1/{target_table}?user_id=eq.{firebase_uid}&page_number=eq.0&select=content",
+            headers=headers
+        )
+        if res.status_code == 200:
+            rows = res.json()
+            if rows and len(rows) > 0:
+                questions_list = json.loads(rows[0]["content"])
+                if 0 <= question_index < len(questions_list):
+                    target_question = questions_list[question_index]
+
+    if not target_question:
+        return {"status": "error", "message": f"Question index {question_index} not found in Supabase session."}
 
     temp_audio_name = f"spoken_{uuid.uuid4()}.m4a"
     temp_audio_path = os.path.join(UPLOAD_DIR, temp_audio_name)
@@ -297,11 +341,11 @@ async def evaluate_audio_recall(
             return {"status": "error", "message": "No audible speech recognized in audio."}
 
         async with httpx.AsyncClient(timeout=30.0) as http_client:
-            combined_context, _ = await fetch_vector_context(http_client, firebase_uid, question, is_premium)
+            combined_context, _ = await fetch_vector_context(http_client, firebase_uid, target_question, is_premium)
 
         eval_prompt = (
             f"TEXTBOOK CONTEXT:\n{combined_context}\n\n"
-            f"EVALUATION QUESTION:\n{question}\n\n"
+            f"EVALUATION QUESTION:\n{target_question}\n\n"
             f"STUDENT SPOKEN ANSWER:\n{student_speech}"
         )
         
@@ -348,6 +392,6 @@ async def flush_voice_session(decoded_token: dict = Depends(verify_firebase_toke
                 f"{SUPABASE_URL}/rest/v1/{target_table}?user_id=eq.{firebase_uid}",
                 headers=headers
             )
-        return {"status": "success", "message": "Supabase vectors flushed for user."}
+        return {"status": "success", "message": "Vectors and session flushed from Supabase."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
