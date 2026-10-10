@@ -10,6 +10,7 @@ from pymongo import MongoClient
 import psycopg2
 import psycopg2.pool
 from psycopg2.extras import RealDictCursor
+import redis.asyncio as aioredis
 
 load_dotenv()
 
@@ -29,6 +30,21 @@ try:
     )
 except Exception as e:
     raise RuntimeError(f"Database Pool Initialization Error: {str(e)}")
+
+REDIS_URL = os.getenv("REDIS_URL")
+redis_client = None
+
+async def get_redis_client():
+    global redis_client
+    if redis_client is None:
+        if not REDIS_URL:
+            raise RuntimeError("CRITICAL ERROR: REDIS_URL is missing in .env file!")
+        redis_client = aioredis.from_url(
+            REDIS_URL,
+            decode_responses=True,
+            max_connections=20
+        )
+    return redis_client
 
 @contextmanager
 def get_postgres_db():
@@ -216,7 +232,41 @@ async def verify_firebase_token(request: Request, authorization: str = Header(No
         elif method == "GET" and any(action in path for action in ["/note/", "/open", "/details"]):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Opening existing notes is a premium feature.")
 
-    elif "/process-voice-material" in path:
+    elif "/upload-chunk" in path:
+        form_data = await request.form()
+        chunk_idx = str(form_data.get("chunk_index", "0")).strip()
+        end_p = int(form_data.get("end_page", 1))
+
+        if chunk_idx != "0" or end_p > 10:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Free Tier Limit: Free version me kewal pehle 10 pages (1 chunk) allow hain. Poori book ke liye Premium lein."
+            )
+
+        if not check_and_increment_limit(user_id, "get_answer_upload", 1):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Daily free limit reached for AI workspace (1 document per day)."
+            )
+
+    elif "/process-voice-chunk" in path:
+        form_data = await request.form()
+        chunk_idx = str(form_data.get("chunk_index", "0")).strip()
+        end_p = int(form_data.get("end_page", 1))
+
+        if chunk_idx != "0" or end_p > 10:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Free Tier Limit: Voice session ke liye kewal pehla chunk (10 pages) allow hai."
+            )
+
+        if not check_and_increment_limit(user_id, "voice_upload", 1):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, 
+                detail="Daily free limit reached for voice feature (1 session per day)."
+            )
+
+    elif "/finalize-voice-session" in path or "/process-voice-material" in path:
         if not check_and_increment_limit(user_id, "voice_upload", 1):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Daily free limit reached for voice feature.")
 

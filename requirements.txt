@@ -6,7 +6,7 @@ python-multipart
 psycopg2-binary
 pymongo
 firebase-admin
-google-genai
+redis
 httpx
 PyMuPDF
 Pillow

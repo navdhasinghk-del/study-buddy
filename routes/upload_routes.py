@@ -1,34 +1,29 @@
 import os
 import re
+import json
 import uuid
 import asyncio
 import shutil
 import traceback
 import httpx
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks, Depends
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
 from fastapi.responses import JSONResponse
 from groq import AsyncGroq
 from openai import AsyncOpenAI
 from utils.upload_helpers import parse_any_file_to_pages, smart_exam_question_parser, process_image_via_vision_ai
-from dependencies import verify_firebase_token, get_user_premium_status
+from dependencies import verify_firebase_token, get_redis_client
 
 router = APIRouter()
 
-groq_free_client = AsyncGroq(api_key=os.getenv("GROQ_FREE_API_KEY"))
-groq_premium_client = AsyncGroq(api_key=os.getenv("GROQ_PREMIUM_API_KEY"))
+groq_client = AsyncGroq(api_key=os.getenv("GROQ_PREMIUM_API_KEY"))
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 GROQ_TEXT_MODEL = "openai/gpt-oss-120b"
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_EMBED_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent"
-
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
-active_indexing_users = set()
 
 SYSTEM_PROMPT = """
 You are a precise academic evaluator and textbook solver. Your job is to answer the target question using ONLY the provided Textbook Context.
@@ -48,23 +43,6 @@ ANSWER: [Targeted answer strictly matching the required depth and language]
 PAGES: [Explicit source page numbers, e.g., Page 1, Page 3]
 """
 
-async def generate_gemini_vector(http_client: httpx.AsyncClient, text: str):
-    url = f"{GEMINI_EMBED_URL}?key={GEMINI_API_KEY}"
-    payload = {
-        "model": "models/gemini-embedding-001",
-        "content": {
-            "parts": [{"text": text}]
-        }
-    }
-    try:
-        response = await http_client.post(url, json=payload, timeout=20.0)
-        if response.status_code == 200:
-            values = response.json().get("embedding", {}).get("values", [])
-            return values, None
-        return [], f"Gemini API Error: HTTP {response.status_code} - {response.text}"
-    except Exception as e:
-        return [], f"Gemini Request Exception: {str(e)}"
-
 async def generate_openai_vector(text: str):
     try:
         response = await openai_client.embeddings.create(
@@ -75,77 +53,48 @@ async def generate_openai_vector(text: str):
     except Exception as e:
         return [], f"OpenAI Embedding Error: {str(e)}"
 
-async def get_embedding_by_tier(http_client: httpx.AsyncClient, text: str, is_premium: bool):
-    if is_premium:
-        return await generate_openai_vector(text)
-    return await generate_gemini_vector(http_client, text)
+@router.post("/upload-chunk")
+async def handle_chunk_upload(
+    file: UploadFile = File(...),
+    chunk_index: int = Form(...),
+    start_page: int = Form(...),
+    end_page: int = Form(...),
+    decoded_token: dict = Depends(verify_firebase_token),
+    redis = Depends(get_redis_client)
+):
+    user_id = decoded_token["uid"].strip().lower()
 
-async def forward_to_worker_for_indexing(file_path: str, firebase_uid: str, is_premium: bool):
-    try:
-        active_indexing_users.add(firebase_uid)
-        texts = await parse_any_file_to_pages(file_path)
-        
-        valid_pages = []
-        for idx, t in enumerate(texts):
-            if t.strip() and t != "[Empty Page]":
-                valid_pages.append((idx + 1, t))
+    unique_id = uuid.uuid4().hex[:8]
+    chunk_filename = f"chunk_{user_id}_{chunk_index}_{unique_id}.pdf"
+    chunk_path = os.path.join(UPLOAD_DIR, chunk_filename)
 
-        if not valid_pages:
-            return
+    with open(chunk_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
-        target_table = "textbook_vectors_premium" if is_premium else "textbook_vectors_free"
+    task_payload = {
+        "user_id": user_id,
+        "file_path": chunk_path,
+        "chunk_index": chunk_index,
+        "start_page": start_page,
+        "end_page": end_page,
+        "target_table": "textbook_vectors_premium"
+    }
 
-        async with httpx.AsyncClient(timeout=60.0) as httpx_client:
-            headers = {
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type": "application/json"
-            }
+    await redis.lpush("pdf_chunk_queue", json.dumps(task_payload))
 
-            records = []
-            for page_num, text in valid_pages:
-                embedding, err = await get_embedding_by_tier(httpx_client, text, is_premium)
-                if embedding:
-                    records.append({
-                        "user_id": firebase_uid,
-                        "page_number": page_num,
-                        "content": text,
-                        "embedding": embedding
-                    })
-
-            if records:
-                await httpx_client.post(
-                    f"{SUPABASE_URL}/rest/v1/{target_table}",
-                    headers=headers,
-                    json=records
-                )
-
-    except Exception as e:
-        pass
-    finally:
-        active_indexing_users.discard(firebase_uid)
-        if os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
+    return {
+        "status": "queued",
+        "chunk_index": chunk_index,
+        "message": f"Pages {start_page} to {end_page} successfully queued"
+    }
 
 @router.post("/get-upload-url")
 async def handle_upload(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     filename: str = Form(...),
     decoded_token: dict = Depends(verify_firebase_token)
 ):
     firebase_uid = decoded_token["uid"].strip().lower()
-    is_premium = get_user_premium_status(firebase_uid)
-    
-    if not is_premium:
-        file.file.seek(0, os.SEEK_END)
-        file_size = file.file.tell()
-        file.file.seek(0)
-        if file_size > 10 * 1024 * 1024:
-            raise HTTPException(status_code=403, detail="Free Tier Limit Reached. File size exceeds 10MB limit.")
 
     try:
         file_ext = os.path.splitext(filename)[1]
@@ -155,20 +104,14 @@ async def handle_upload(
         with open(path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
             
-        is_question_paper = any(k in clean_name.lower() for k in ["question", "prashna", "paper", "qp_"])
-        
-        if not is_question_paper:
-            background_tasks.add_task(forward_to_worker_for_indexing, path, firebase_uid, is_premium)
-            return {"status": "uploaded", "file_id": clean_name, "message": "Document indexing started."}
-            
-        return {"status": "uploaded", "file_id": clean_name, "message": "Question paper received."}
+        return {"status": "uploaded", "file_id": clean_name, "message": "File received successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-async def fetch_vector_context(http_client: httpx.AsyncClient, firebase_uid: str, question: str, is_premium: bool):
+async def fetch_vector_context(http_client: httpx.AsyncClient, firebase_uid: str, question: str):
     try:
         clean_q = re.sub(r'\[.*?\]', '', question).strip()
-        query_vector, embed_err = await get_embedding_by_tier(http_client, clean_q, is_premium)
+        query_vector, embed_err = await generate_openai_vector(clean_q)
         if not query_vector:
             return None, f"[Callback: Embedding Generation Failed -> {embed_err}]"
 
@@ -178,8 +121,6 @@ async def fetch_vector_context(http_client: httpx.AsyncClient, firebase_uid: str
             "Content-Type": "application/json"
         }
         
-        rpc_function = "match_textbook_vectors_premium" if is_premium else "match_textbook_vectors_free"
-        
         rpc_payload = {
             "query_embedding": query_vector,
             "match_threshold": -1.0,
@@ -188,13 +129,13 @@ async def fetch_vector_context(http_client: httpx.AsyncClient, firebase_uid: str
         }
 
         resp = await http_client.post(
-            f"{SUPABASE_URL}/rest/v1/rpc/{rpc_function}",
+            f"{SUPABASE_URL}/rest/v1/rpc/match_textbook_vectors_premium",
             headers=headers,
             json=rpc_payload
         )
 
         if resp.status_code != 200:
-            return None, f"[Callback: Supabase RPC {rpc_function} Failed -> HTTP {resp.status_code}: {resp.text}]"
+            return None, f"[Callback: Supabase RPC match_textbook_vectors_premium Failed -> HTTP {resp.status_code}: {resp.text}]"
 
         matches = resp.json()
         if not matches:
@@ -211,19 +152,18 @@ async def fetch_vector_context(http_client: httpx.AsyncClient, firebase_uid: str
     except Exception as vector_err:
         return None, f"[Callback: Vector Fetch Exception -> {str(vector_err)}]"
 
-async def evaluate_single_question_parallel(http_client: httpx.AsyncClient, firebase_uid: str, q: str, is_premium: bool, semaphore: asyncio.Semaphore) -> str:
+async def evaluate_single_question_parallel(http_client: httpx.AsyncClient, firebase_uid: str, q: str, semaphore: asyncio.Semaphore) -> str:
     async with semaphore:
         clean_q = re.sub(r'\[.*?\]', '', q).strip()
-        combined_context, error_msg = await fetch_vector_context(http_client, firebase_uid, q, is_premium)
+        combined_context, error_msg = await fetch_vector_context(http_client, firebase_uid, q)
         
         if error_msg or not combined_context:
             return f"QUESTION: {clean_q}\nANSWER: {error_msg}\nPAGES: N/A"
             
         prompt_content = f"TEXTBOOK CONTEXT:\n{combined_context}\n\nTARGET QUESTION STATEMENT & INSTRUCTION:\n{q}"
-        selected_groq = groq_premium_client if is_premium else groq_free_client
 
         try:
-            response = await selected_groq.chat.completions.create(
+            response = await groq_client.chat.completions.create(
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt_content}
@@ -256,7 +196,6 @@ async def process_solution(
 ):
     q_path = ""
     firebase_uid = decoded_token["uid"].strip().lower()
-    is_premium = get_user_premium_status(firebase_uid)
 
     try:
         if file:
@@ -282,17 +221,12 @@ async def process_solution(
                 status_code=200
             )
             
-        wait_limit = 120
-        while firebase_uid in active_indexing_users and wait_limit > 0:
-            await asyncio.sleep(1.0)
-            wait_limit -= 1
-            
         ext = os.path.splitext(q_path)[-1].lower()
         if ext in [".png", ".jpg", ".jpeg", ".webp"]:
-            questions = await process_image_via_vision_ai(q_path, is_premium=is_premium)
+            questions = await process_image_via_vision_ai(q_path, is_premium=True)
         else:
             parsed_q_pages = await parse_any_file_to_pages(q_path)
-            questions = await smart_exam_question_parser(parsed_q_pages, is_premium=is_premium)
+            questions = await smart_exam_question_parser(parsed_q_pages, is_premium=True)
             
         if not questions:
             return {"status": "success", "answer": "No valid questions found to process."}
@@ -301,7 +235,7 @@ async def process_solution(
 
         async with httpx.AsyncClient(timeout=60.0) as http_client:
             tasks = [
-                evaluate_single_question_parallel(http_client, firebase_uid, q, is_premium, semaphore) 
+                evaluate_single_question_parallel(http_client, firebase_uid, q, semaphore) 
                 for q in questions
             ]
             results = await asyncio.gather(*tasks)
@@ -321,8 +255,6 @@ async def process_solution(
 @router.post("/flush-session")
 async def flush_session(decoded_token: dict = Depends(verify_firebase_token)):
     firebase_uid = decoded_token["uid"].strip().lower()
-    is_premium = get_user_premium_status(firebase_uid)
-    target_table = "textbook_vectors_premium" if is_premium else "textbook_vectors_free"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as httpx_client:
@@ -331,7 +263,7 @@ async def flush_session(decoded_token: dict = Depends(verify_firebase_token)):
                 "Authorization": f"Bearer {SUPABASE_KEY}"
             }
             await httpx_client.delete(
-                f"{SUPABASE_URL}/rest/v1/{target_table}?user_id=eq.{firebase_uid}",
+                f"{SUPABASE_URL}/rest/v1/textbook_vectors_premium?user_id=eq.{firebase_uid}",
                 headers=headers
             )
         return {"status": "success", "message": f"Cloud storage flushed for user: {firebase_uid}"}

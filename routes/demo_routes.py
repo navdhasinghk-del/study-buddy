@@ -10,7 +10,7 @@ from dependencies import get_postgres_db
 
 router = APIRouter(prefix="/demo", tags=["Demo Portal"])
 
-groq_client = AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
+groq_client = AsyncGroq(api_key=os.getenv("GROQ_PREMIUM_API_KEY"))
 GROQ_TEXT_MODEL = "openai/gpt-oss-120b"
 
 def get_client_ip(request: Request) -> str:
