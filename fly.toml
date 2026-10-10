@@ -1,12 +1,11 @@
-# fly.toml app configuration file generated for study-buddy-xf1hwg on 2026-10-10T04:06:27Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
-
 app = 'study-buddy-xf1hwg'
 primary_region = 'sin'
 
 [build]
+
+[mounts]
+  source = "app_storage"
+  destination = "/app/data"
 
 [http_service]
   internal_port = 5000
